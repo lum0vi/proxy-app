@@ -1,0 +1,77 @@
+import { setTimeout as delay } from 'node:timers/promises';
+import { config } from './config.js';
+import { closeDatabase, sql } from './db/index.js';
+import { ceLogin, ceProvisioningErrorCode, ceProvisioningSettings, listCeGroups, provisionCeKeys } from './services/ce-provisioning.js';
+import { processNotifications } from './services/notifications.js';
+import { retryPaidOrders } from './services/orders.js';
+import { refreshUpstreamCatalog } from './services/upstream-catalog.js';
+
+let stopping = false;
+process.on('SIGTERM', () => { stopping = true; });
+process.on('SIGINT', () => { stopping = true; });
+
+async function housekeeping(): Promise<void> {
+  await sql`DELETE FROM sessions WHERE expires_at <= now()`;
+  await sql`DELETE FROM request_leases WHERE expires_at <= now()`;
+  await sql`DELETE FROM session_affinities WHERE expires_at <= now()`;
+  await sql`
+    UPDATE orders SET status = 'EXPIRED', updated_at = now()
+    WHERE status = 'PENDING' AND reserved_until <= now()
+  `;
+  await sql`
+    UPDATE api_keys SET status = 'EXPIRED', updated_at = now()
+    WHERE status IN ('ACTIVE', 'PAUSED') AND expires_at IS NOT NULL AND expires_at <= now()
+  `;
+}
+
+async function healthCheckUpstreams(): Promise<void> {
+  const credentials = await sql<{ id: string }[]>`
+    SELECT uc.id
+    FROM upstream_credentials uc JOIN upstream_pools up ON up.id = uc.pool_id
+    WHERE uc.status IN ('ACTIVE', 'DEGRADED') AND up.active = true AND (NOT uc.test_only OR ${config.testUpstreamsEnabled})
+  `;
+  for (let i = 0; i < credentials.length; i += 8) {
+    const results = await Promise.allSettled(credentials.slice(i, i + 8).map(({ id }) => refreshUpstreamCatalog(id)));
+    if (results.some((result) => result.status === 'rejected')) console.error('Could not persist one or more provider health checks');
+  }
+}
+
+async function main(): Promise<void> {
+  let ceSettings: ReturnType<typeof ceProvisioningSettings>;
+  try { ceSettings = ceProvisioningSettings(); }
+  catch (error) { console.error(error instanceof Error ? error.message : 'Invalid CE provisioning configuration'); }
+  let nextHealthCheck = 0;
+  while (!stopping) {
+    try {
+      await housekeeping();
+      if (Date.now() >= nextHealthCheck) {
+        await healthCheckUpstreams();
+        nextHealthCheck = Date.now() + config.UPSTREAM_HEALTH_INTERVAL_MS;
+      }
+      if (ceSettings) {
+        try { await provisionCeKeys(ceSettings); }
+        catch (error) { console.error(`CE key provisioning paused for this cycle: ${ceProvisioningErrorCode(error)}`); }
+      }
+      await retryPaidOrders();
+      await processNotifications();
+    } catch (error) {
+      console.error(error);
+    }
+    await delay(60_000);
+  }
+  await closeDatabase();
+}
+
+async function showCeGroups() {
+  try {
+    const result = await listCeGroups(ceLogin());
+    if (!result) throw new Error('CE key provisioning is running. Retry when it completes.');
+    console.log(JSON.stringify(result, null, 2));
+  } catch (error) {
+    if (error instanceof Error && /^(Set CE_PROVISION_EMAIL|CE key provisioning is running)/.test(error.message)) console.error(error.message);
+    else console.error(`Could not list CE groups: ${ceProvisioningErrorCode(error)}`);
+    process.exitCode = 1;
+  } finally { await closeDatabase(); }
+}
+
+void (process.argv[2] === '--ce-groups' ? showCeGroups() : main());

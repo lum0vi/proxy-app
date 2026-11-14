@@ -1,0 +1,29 @@
+{
+  "name": "proxiapp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.22.3"
+  },
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @proxi/api && npm run build --workspace @proxi/web",
+    "dev": "concurrently -n api,web -c cyan,magenta \"npm run dev --workspace @proxi/api\" \"npm run dev --workspace @proxi/web\"",
+    "typecheck": "npm run typecheck --workspace @proxi/api && npm run typecheck --workspace @proxi/web",
+    "test": "npm run test --workspace @proxi/api && npm run test --workspace @proxi/web",
+    "test:coverage": "npm run test:coverage --workspace @proxi/api && npm run test:coverage --workspace @proxi/web",
+    "db:migrate": "npm run db:migrate --workspace @proxi/api",
+    "db:seed": "npm run db:seed --workspace @proxi/api",
+    "start": "npm run start --workspace @proxi/api"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "light-my-request": "6.6.0"
+  },
+  "overrides": {
+    "cookie": "1.1.1"
+  }
+}

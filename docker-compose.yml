@@ -1,0 +1,152 @@
+x-app-environment: &app-environment
+  NODE_ENV: ${NODE_ENV:-development}
+  DATABASE_URL: ${DATABASE_URL:-postgres://proxiapp:change-me-in-production@postgres:5432/proxiapp}
+  PUBLIC_APP_URL: ${PUBLIC_APP_URL:-http://localhost:8080}
+  SESSION_SECRET: ${SESSION_SECRET:-local-development-session-secret-32-chars}
+  KEY_ENCRYPTION_SECRET: ${KEY_ENCRYPTION_SECRET:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+  ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
+  ADMIN_PASSWORD: ${ADMIN_PASSWORD:-ChangeThisAdminPassword123!}
+  PRICE_MARKUP: ${PRICE_MARKUP:-2}
+  USERS_PER_UPSTREAM_KEY: ${USERS_PER_UPSTREAM_KEY:-2}
+  PAYMENT_METHODS: ${PAYMENT_METHODS:-mock}
+  ALLOW_MOCK_PAYMENTS: ${ALLOW_MOCK_PAYMENTS:-true}
+  TRUST_PROXY: ${TRUST_PROXY:-true}
+
+services:
+  postgres:
+    image: postgres:16.16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-proxiapp}
+      POSTGRES_USER: ${POSTGRES_USER:-proxiapp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-in-production}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-55432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-proxiapp} -d ${POSTGRES_DB:-proxiapp}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: .
+      target: api
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      <<: *app-environment
+    command: ["sh", "-c", "node apps/api/dist/db/migrate.js && node apps/api/dist/db/seed.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      target: api
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      <<: *app-environment
+      API_HOST: 0.0.0.0
+      API_PORT: 3000
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health/live').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      target: api
+    env_file:
+      - path: .env
+        required: false
+      - path: .env.ce
+        required: false
+    environment:
+      <<: *app-environment
+    command: ["node", "apps/api/dist/worker.js"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  nginx:
+    build:
+      context: .
+      target: gateway
+    ports:
+      - "${APP_BIND_ADDRESS:-127.0.0.1}:${APP_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.17.1
+    environment:
+      DATA_SOURCE_NAME: ${DATABASE_URL:-postgresql://proxiapp:change-me-in-production@postgres:5432/proxiapp?sslmode=disable}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  nginx-exporter:
+    image: nginx/nginx-prometheus-exporter:1.4.0
+    command: ["--nginx.scrape-uri=http://nginx/nginx_status"]
+    depends_on:
+      nginx:
+        condition: service_started
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-30d}
+      - --web.enable-lifecycle
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.5.1
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_SERVER_ROOT_URL: ${PUBLIC_APP_URL:-http://localhost:8080}/grafana/
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  prometheus_data:
+  grafana_data:

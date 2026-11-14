@@ -1,0 +1,63 @@
+groups:
+  - name: proxiapp-health
+    rules:
+      - alert: ProxiAppDown
+        expr: up{job="proxiapp"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: ProxyKey API is unavailable
+          description: Prometheus could not scrape the API for two minutes.
+
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: PostgreSQL is unavailable
+          description: Orders, authentication, and proxy accounting cannot proceed.
+
+      - alert: HighProxyErrorRate
+        expr: |
+          sum(rate(proxiapp_proxy_requests_total{status=~"5..|UPSTREAM_.*"}[5m]))
+          / clamp_min(sum(rate(proxiapp_proxy_requests_total[5m])), 0.001) > 0.05
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: AI proxy error rate is above 5%
+
+      - alert: HighProxyP95Latency
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(proxiapp_proxy_request_duration_seconds_bucket[10m]))) > 30
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: AI proxy p95 latency is above 30 seconds
+
+      - alert: NodeEventLoopSaturated
+        expr: proxiapp_nodejs_eventloop_lag_p99_seconds > 0.25
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: Node.js event loop p99 lag is above 250ms
+
+      - alert: ProviderCapacityExhausted
+        expr: proxiapp_upstream_customer_key_capacity{kind="sellable"} <= 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: Provider pool {{ $labels.provider }} has no sale capacity
+
+      - alert: PaidOrdersWaitingForKey
+        expr: proxiapp_pending_orders{status="paid"} > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: Confirmed orders are still waiting for keys
+
+      - alert: UsageRequiresReconciliation
+        expr: sum by (provider) (increase(proxiapp_proxy_accounting_anomalies_total[15m])) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: Review unconfirmed or unposted upstream usage for {{ $labels.provider }}
