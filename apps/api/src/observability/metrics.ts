@@ -7,6 +7,8 @@ import {
   collectDefaultMetrics,
 } from 'prom-client';
 import { sql } from '../db/index.js';
+import { config } from '../config.js';
+import { ceBalanceProvider, providerBalanceStatus } from '../services/provider-balances.js';
 
 export const metricsRegistry = new Registry();
 collectDefaultMetrics({ register: metricsRegistry, prefix: 'proxiapp_' });
@@ -98,7 +100,31 @@ const pendingOrders = new Gauge({
   registers: [metricsRegistry],
 });
 
+const providerBalance = new Gauge({ name: 'proxiapp_provider_account_balance_usd', help: 'Last confirmed provider account balance in USD',
+  labelNames: ['provider'] as const, registers: [metricsRegistry] });
+const providerBalanceThreshold = new Gauge({ name: 'proxiapp_provider_account_low_balance_threshold_usd', help: 'Provider low balance alert threshold in USD',
+  labelNames: ['provider'] as const, registers: [metricsRegistry] });
+const providerBalanceChecked = new Gauge({ name: 'proxiapp_provider_account_balance_checked_timestamp_seconds', help: 'Time of last successful account balance check',
+  labelNames: ['provider'] as const, registers: [metricsRegistry] });
+const providerBalanceHealthy = new Gauge({ name: 'proxiapp_provider_account_balance_check_healthy', help: 'Whether enabled account balance monitoring is fresh and successful',
+  labelNames: ['provider'] as const, registers: [metricsRegistry] });
+const providerBalanceMonitoring = new Gauge({ name: 'proxiapp_provider_account_balance_monitor_enabled', help: 'Whether account balance monitoring is enabled',
+  labelNames: ['provider'] as const, registers: [metricsRegistry] });
+
 async function refreshBusinessMetrics(): Promise<void> {
+  for (const gauge of [providerBalance, providerBalanceThreshold, providerBalanceChecked, providerBalanceHealthy, providerBalanceMonitoring]) gauge.reset();
+  const ceLabels = { provider: ceBalanceProvider };
+  providerBalanceMonitoring.set(ceLabels, Number(config.ceBalanceMonitorEnabled));
+  if (config.ceBalanceMonitorEnabled) providerBalanceHealthy.set(ceLabels, 0);
+  for (const balance of await providerBalanceStatus()) {
+    const labels = { provider: balance.provider };
+    providerBalanceMonitoring.set(labels, Number(balance.enabled));
+    if (!balance.enabled) continue;
+    if (balance.balanceUsd !== null) providerBalance.set(labels, Number(balance.balanceUsd));
+    providerBalanceThreshold.set(labels, Number(balance.lowThresholdUsd));
+    providerBalanceChecked.set(labels, balance.checkedAt ? balance.checkedAt.getTime() / 1000 : 0);
+    providerBalanceHealthy.set(labels, Number(!balance.stale && !balance.lastError));
+  }
   const pools = await sql<{ provider: string; total: number; assigned: number; reserved: number; sellable: number }[]>`
     SELECT up.slug AS provider,
       COALESCE(sum(slots.credential_capacity), 0)::int AS total,

@@ -1,9 +1,11 @@
 import { Decimal } from 'decimal.js';
+import type postgres from 'postgres';
 import { config } from '../config.js';
 import { sql } from '../db/index.js';
 import { sendMail } from './mailer.js';
 
 interface NoticeRow {
+  attempts: number;
   userId: string;
   email: string;
   locale: 'ru' | 'en';
@@ -35,14 +37,16 @@ async function enqueueNotices(): Promise<void> {
     await sql`
       INSERT INTO notifications (user_id, api_key_id, kind, dedupe_key, payload)
       SELECT ak.user_id, ak.id, 'KEY_BALANCE',
-        'key-balance:' || ak.id::text || ':' || ${percent}::numeric::text,
+        'key-balance:' || ak.id::text || ':' || ${percent}::numeric::text
+          || CASE WHEN ak.credits_total = COALESCE(o.credit_amount, o.amount) THEN '' ELSE ':' || ak.credits_total::text END,
         jsonb_build_object(
           'threshold', ${percent}::numeric,
           'detail', (ak.credits_total - ak.credits_used)::text,
           'label', ak.label
         )
-      FROM api_keys ak
-      WHERE ak.status = 'ACTIVE'
+      FROM api_keys ak JOIN orders o ON o.id = ak.order_id
+      WHERE ak.status IN ('ACTIVE', 'EXHAUSTED')
+        AND (ak.expires_at IS NULL OR ak.expires_at > now())
         AND ((ak.credits_total - ak.credits_used) / ak.credits_total * 100) <= ${percent}::numeric
       ON CONFLICT (dedupe_key) DO NOTHING
     `;
@@ -57,16 +61,16 @@ async function enqueueNotices(): Promise<void> {
   `;
 }
 
-async function pendingNotices(): Promise<NoticeRow[]> {
-  return sql<NoticeRow[]>`
-    SELECT n.user_id, u.email::text, u.locale, n.api_key_id AS key_id,
+async function pendingNotices(db: postgres.TransactionSql): Promise<NoticeRow[]> {
+  return db<NoticeRow[]>`
+    SELECT n.attempts, n.user_id, u.email::text, u.locale, n.api_key_id AS key_id,
       COALESCE(n.payload->>'label', 'API key') AS label, n.kind,
       COALESCE((n.payload->>'threshold')::int, 0) AS threshold,
       n.dedupe_key, COALESCE(n.payload->>'detail', '') AS detail
     FROM notifications n JOIN users u ON u.id = n.user_id
-    WHERE n.status = 'PENDING'
+    WHERE n.status IN ('PENDING', 'FAILED') AND n.retry_at <= now() AND u.status = 'ACTIVE'
     ORDER BY n.created_at
-    LIMIT 100
+    LIMIT 1 FOR UPDATE OF n SKIP LOCKED
   `;
 }
 
@@ -75,8 +79,8 @@ function message(notice: NoticeRow): { subject: string; text: string } {
   if (notice.kind === 'KEY_CREATED') {
     const balance = new Decimal(notice.detail || 0).toFixed(2);
     return ru
-      ? { subject: 'Ваш ключ ProxyKey готов', text: `Ключ «${notice.label}» активирован. Баланс $${balance}. Откройте кабинет, чтобы скопировать ключ.` }
-      : { subject: 'Your ProxyKey is ready', text: `Key “${notice.label}” is active with a $${balance} balance. Open your dashboard to copy the key.` };
+      ? { subject: 'Ваш ключ ProxyKey готов', text: `Ключ «${notice.label}» активирован. Баланс ${balance} USDT. Откройте кабинет, чтобы скопировать ключ.` }
+      : { subject: 'Your ProxyKey is ready', text: `Key “${notice.label}” is active with a ${balance} USDT balance. Open your dashboard to copy the key.` };
   }
   if (notice.kind === 'KEY_EXPIRY') {
     return ru
@@ -85,21 +89,30 @@ function message(notice: NoticeRow): { subject: string; text: string } {
   }
   const remaining = new Decimal(notice.detail || 0).toFixed(4);
   return ru
-    ? { subject: 'На API-ключе мало средств', text: `На ключе «${notice.label}» осталось не более ${notice.threshold}% оплаченного баланса (примерно $${remaining}).` }
-    : { subject: 'API key balance is running low', text: `Key “${notice.label}” has no more than ${notice.threshold}% of its balance remaining (about $${remaining}).` };
+    ? { subject: 'На API-ключе мало средств', text: `На ключе «${notice.label}» осталось не более ${notice.threshold}% оплаченного баланса (примерно ${remaining} USDT).` }
+    : { subject: 'API key balance is running low', text: `Key “${notice.label}” has no more than ${notice.threshold}% of its balance remaining (about ${remaining} USDT).` };
 }
 
-export async function processNotifications(): Promise<void> {
+export async function processNotifications(deliver: typeof sendMail = sendMail, smtpConfigured = Boolean(config.SMTP_HOST)): Promise<void> {
   await enqueueNotices();
-  for (const notice of await pendingNotices()) {
-    try {
-      await sendMail({ to: notice.email, ...message(notice) });
-      await sql`UPDATE notifications SET status = 'SENT', sent_at = now() WHERE dedupe_key = ${notice.dedupeKey}`;
-    } catch (error) {
-      await sql`
-        UPDATE notifications SET status = 'FAILED', error = ${error instanceof Error ? error.message : String(error)}
-        WHERE dedupe_key = ${notice.dedupeKey}
-      `;
-    }
+  // Lock only the current delivery so parallel workers cannot send the same notice.
+  for (let index = 0; index < 100; index++) {
+    const handled = await sql.begin(async db => {
+      const [notice] = await pendingNotices(db);
+      if (!notice) return false;
+      try {
+        if (!smtpConfigured) throw new Error('SMTP_NOT_CONFIGURED');
+        await deliver({ to: notice.email, ...message(notice) });
+        await db`UPDATE notifications SET status = 'SENT', sent_at = now(), error = NULL,
+          attempts = attempts + 1 WHERE dedupe_key = ${notice.dedupeKey}`;
+      } catch {
+        const code = smtpConfigured ? 'SMTP_DELIVERY_FAILED' : 'SMTP_NOT_CONFIGURED';
+        await db`UPDATE notifications SET status = 'PENDING', error = ${code}, attempts = attempts + 1,
+          retry_at = now() + make_interval(secs => ${Math.min(3600, 60 * 2 ** Math.min(notice.attempts, 6))})
+          WHERE dedupe_key = ${notice.dedupeKey}`;
+      }
+      return true;
+    });
+    if (!handled) break;
   }
 }

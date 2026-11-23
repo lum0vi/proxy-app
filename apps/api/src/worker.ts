@@ -1,14 +1,18 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { config } from './config.js';
 import { closeDatabase, sql } from './db/index.js';
-import { ceLogin, ceProvisioningErrorCode, ceProvisioningSettings, listCeGroups, provisionCeKeys } from './services/ce-provisioning.js';
+import { ceLogin, checkCeBalance, ceProvisioningErrorCode, ceProvisioningSettings, listCeGroups, provisionCeKeys, syncCeKeys } from './services/ce-provisioning.js';
+import { providerKeyRefreshRequested, recordProviderKeyFailure } from './services/provider-keys.js';
+import { ceBalanceProvider, processProviderBalanceAlerts, recordProviderBalanceFailure } from './services/provider-balances.js';
 import { processNotifications } from './services/notifications.js';
 import { retryPaidOrders } from './services/orders.js';
 import { refreshUpstreamCatalog } from './services/upstream-catalog.js';
 
 let stopping = false;
-process.on('SIGTERM', () => { stopping = true; });
-process.on('SIGINT', () => { stopping = true; });
+const shutdown = new AbortController();
+const stop = () => { stopping = true; shutdown.abort(); };
+process.on('SIGTERM', stop);
+process.on('SIGINT', stop);
 
 async function housekeeping(): Promise<void> {
   await sql`DELETE FROM sessions WHERE expires_at <= now()`;
@@ -41,9 +45,21 @@ async function main(): Promise<void> {
   try { ceSettings = ceProvisioningSettings(); }
   catch (error) { console.error(error instanceof Error ? error.message : 'Invalid CE provisioning configuration'); }
   let nextHealthCheck = 0;
+  let nextBalanceCheck = 0;
+  let nextKeySync = 0;
   while (!stopping) {
     try {
       await housekeeping();
+      if (config.ceKeySyncEnabled && (Date.now() >= nextKeySync || await providerKeyRefreshRequested())) {
+        try { await syncCeKeys(ceLogin()); }
+        catch { await recordProviderKeyFailure('CE_KEY_SYNC_FAILED_OR_LOGIN_MISSING'); }
+        nextKeySync = Date.now() + config.CE_KEY_SYNC_INTERVAL_MS;
+      }
+      if (config.ceBalanceMonitorEnabled && Date.now() >= nextBalanceCheck) {
+        try { await checkCeBalance(ceLogin()); }
+        catch { await recordProviderBalanceFailure(ceBalanceProvider, 'CE_BALANCE_CHECK_FAILED_OR_LOGIN_MISSING'); }
+        nextBalanceCheck = Date.now() + config.PROVIDER_BALANCE_CHECK_INTERVAL_MS;
+      }
       if (Date.now() >= nextHealthCheck) {
         await healthCheckUpstreams();
         nextHealthCheck = Date.now() + config.UPSTREAM_HEALTH_INTERVAL_MS;
@@ -53,11 +69,14 @@ async function main(): Promise<void> {
         catch (error) { console.error(`CE key provisioning paused for this cycle: ${ceProvisioningErrorCode(error)}`); }
       }
       await retryPaidOrders();
+      await processProviderBalanceAlerts();
       await processNotifications();
     } catch (error) {
       console.error(error);
     }
-    await delay(60_000);
+    await delay(60_000, undefined, { signal: shutdown.signal }).catch(error => {
+      if (!stopping) throw error;
+    });
   }
   await closeDatabase();
 }

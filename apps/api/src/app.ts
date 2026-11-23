@@ -27,7 +27,7 @@ export async function buildApp(): Promise<FastifyInstance> {
 
   await app.register(cookie);
   await app.register(cors, {
-    origin: config.NODE_ENV === 'production' ? config.PUBLIC_APP_URL : true,
+    origin: config.browserOrigins,
     credentials: true,
   });
   await app.register(helmet, {
@@ -44,7 +44,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     if (request.url.startsWith('/api/webhooks/')) return;
     if (!request.cookies[sessionCookieName]) return;
     const origin = request.headers.origin;
-    if (origin && origin !== config.PUBLIC_APP_URL) {
+    if (origin && !config.browserOrigins.includes(origin)) {
       throw new AppError(403, 'INVALID_ORIGIN', 'Request origin is not allowed');
     }
   });
@@ -79,6 +79,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   app.get('/api/config', async () => ({
     appName: config.APP_NAME,
     paymentMethods: config.salesEnabled ? config.paymentMethods : [],
+    paymentCurrencies: config.salesEnabled ? config.paymentCurrencies : [],
   }));
 
   return app;

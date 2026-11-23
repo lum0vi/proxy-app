@@ -3,7 +3,8 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { sql } from '../db/index.js';
 import { decryptSecret } from '../lib/crypto.js';
-import { ceLogin, ceProvisioningSettings, provisionCeKeys } from './ce-provisioning.js';
+import { ceLogin, checkCeBalance, ceProvisioningSettings, provisionCeKeys } from './ce-provisioning.js';
+import { ceBalanceProvider, processProviderBalanceAlerts, providerBalanceStatus } from './provider-balances.js';
 
 const integration = process.env.RUN_INTEGRATION_TESTS === 'true' ? describe : describe.skip;
 
@@ -35,6 +36,7 @@ integration('CE PayGo key provisioning', () => {
   let subscriptionType = 'standard';
   let catalogReady = false;
   let loseCreateResponse = true;
+  let accountUnavailable = false;
 
   const request: typeof fetch = (url, init) => {
     const route = new URL(String(url));
@@ -64,7 +66,8 @@ integration('CE PayGo key provisioning', () => {
       nextToken = `mock-rotated-${randomUUID()}`;
       return envelope({ access_token: access, refresh_token: nextToken, expires_in: 3600 });
     });
-    http.get('/api/v1/auth/me', async () => envelope({ id: 42, balance }));
+    http.get('/api/v1/auth/me', async (_req, reply) => accountUnavailable
+      ? reply.code(503).send({ error: 'Synthetic account API failure' }) : envelope({ id: 42, balance }));
     http.get('/api/v1/groups/available', async () => envelope([{ id: 117, name: 'Codex Plus Pool (PayGo)', subscription_type: subscriptionType }]));
     http.get('/api/v1/keys', async (req) => {
       const { search } = req.query as { search: string };
@@ -101,13 +104,14 @@ integration('CE PayGo key provisioning', () => {
     `;
     poolId = pool!.id;
     await sql`INSERT INTO products (pool_id, name, slug, wholesale_credits, currency, concurrency_limit)
-      VALUES (${poolId}, 'Provisioning test', ${slug}, 25, 'USD', 2)`;
+      VALUES (${poolId}, 'Provisioning test', ${slug}, 25, 'USDT', 2)`;
     await sql`INSERT INTO model_rates (pool_id, model, input_per_million, output_per_million)
       VALUES (${poolId}, 'priced-ce-model', 1, 1)`;
   });
 
   afterAll(async () => {
     await http?.close();
+    await sql`DELETE FROM provider_balances WHERE provider = ${ceBalanceProvider}`;
     if (poolId) {
       await sql`DELETE FROM ce_key_provisioning_jobs WHERE pool_id = ${poolId}`;
       await sql`DELETE FROM upstream_credentials WHERE pool_id = ${poolId}`;
@@ -165,5 +169,62 @@ integration('CE PayGo key provisioning', () => {
     expect(await sql`SELECT credential_capacity FROM sellable_upstream_slots WHERE pool_id = ${poolId}`)
       .toEqual([{ credentialCapacity: 2 }]);
     expect(await sql`SELECT id FROM ce_key_provisioning_jobs WHERE pool_id = ${poolId}`).toHaveLength(0);
+  });
+
+  it('monitors the account without issuing keys and retries, deduplicates and rearms low-balance emails', async () => {
+    const reads = () => sql`SELECT status, last_error FROM provider_balance_alerts WHERE provider = ${ceBalanceProvider} ORDER BY created_at`;
+    const retryNow = () => sql`UPDATE provider_balance_alerts SET retry_at = now() - interval '1 minute' WHERE provider = ${ceBalanceProvider}`;
+    balance = 15;
+    await Promise.all([checkCeBalance(login, request), checkCeBalance(login, request)]);
+    expect(await reads()).toEqual([{ status: 'PENDING', lastError: null }]);
+    expect(await providerBalanceStatus()).toMatchObject([{ balanceUsd: '15.00000000', lowBalance: true, stale: false, enabled: true }]);
+    expect(requests).toBe(1);
+
+    const delivered: { to: string; subject: string; text: string }[] = [];
+    const deliver = async (email: typeof delivered[number]) => { delivered.push(email); };
+    await processProviderBalanceAlerts(deliver, false);
+    expect(delivered).toHaveLength(0);
+    expect(await reads()).toEqual([{ status: 'PENDING', lastError: 'SMTP_NOT_CONFIGURED' }]);
+    await retryNow();
+    await processProviderBalanceAlerts(async () => { throw new Error('private SMTP diagnostic'); }, true);
+    expect(await reads()).toEqual([{ status: 'PENDING', lastError: 'SMTP_DELIVERY_FAILED' }]);
+    await retryNow();
+    await Promise.all([processProviderBalanceAlerts(deliver, true), processProviderBalanceAlerts(deliver, true)]);
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]?.text).toContain('$15.00');
+    expect(await reads()).toEqual([{ status: 'SENT', lastError: null }]);
+    await checkCeBalance(login, request);
+    expect(await reads()).toHaveLength(1);
+
+    await sql`UPDATE provider_balances SET next_notification_at = now() - interval '1 minute' WHERE provider = ${ceBalanceProvider}`;
+    await checkCeBalance(login, request);
+    expect(await reads()).toHaveLength(2);
+    balance = 200;
+    await checkCeBalance(login, request);
+    expect(await reads()).toMatchObject([{ status: 'SENT' }, { status: 'CANCELLED' }]);
+    balance = 0;
+    await checkCeBalance(login, request);
+    expect(await reads()).toMatchObject([{ status: 'SENT' }, { status: 'CANCELLED' }, { status: 'PENDING' }]);
+    expect(await providerBalanceStatus()).toMatchObject([{ balanceUsd: '0.00000000', lowBalance: true, lastError: null }]);
+
+    accountUnavailable = true;
+    await checkCeBalance(login, request);
+    await processProviderBalanceAlerts(deliver, true);
+    expect(delivered).toHaveLength(1);
+    expect(await providerBalanceStatus()).toMatchObject([{ balanceUsd: '0.00000000', lastError: 'CE_HTTP_ERROR_503' }]);
+    accountUnavailable = false;
+    balance = 200;
+    await checkCeBalance(login, request);
+    expect(await providerBalanceStatus()).toMatchObject([{ balanceUsd: '200.00000000', lowBalance: false, lastError: null }]);
+  });
+
+  it('replenishes spare capacity when old keys are almost empty or exhausted', async () => {
+    await sql`UPDATE upstream_credentials SET spend_used = spend_limit - 0.00000001 WHERE pool_id = ${poolId}`;
+    await provisionCeKeys(settings, request);
+    expect(requests).toBe(2);
+    await sql`UPDATE upstream_credentials SET spend_used = spend_limit, status = 'EXHAUSTED' WHERE pool_id = ${poolId}`;
+    await provisionCeKeys(settings, request);
+    expect(requests).toBe(3);
+    expect(await sql`SELECT credential_capacity FROM sellable_upstream_slots WHERE pool_id = ${poolId}`).toEqual([{ credentialCapacity: 2 }]);
   });
 });

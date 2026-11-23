@@ -102,6 +102,22 @@ export function prepareInference(request: FastifyRequest, endpoint: string, keyI
   }
   if (isImage && json.stream === true) throw new AppError(400, 'IMAGE_STREAM_NOT_SUPPORTED', 'Use non-streaming image generation');
 
+  // Prices only cover standard text generation. A caller must not select a
+  // different upstream billing tier or audio pricing through pass-through fields.
+  if (endpoint === '/v1/responses' || isChat) {
+    if (json.service_tier != null && !['auto', 'default'].includes(String(json.service_tier))) {
+      throw new AppError(400, 'UNPRICED_REQUEST_OPTION', 'Use the default service tier for this model');
+    }
+    json.service_tier = 'default';
+  }
+  if (isChat && (json.audio != null || (json.modalities != null
+    && (!Array.isArray(json.modalities) || json.modalities.some(value => value !== 'text'))))) {
+    throw new AppError(400, 'UNPRICED_REQUEST_OPTION', 'Audio generation is not priced by this gateway');
+  }
+  if (endpoint.startsWith('/v1/responses') && json.prompt != null) {
+    throw new AppError(400, 'STORED_RESOURCE_NOT_SUPPORTED', 'Send inline instructions instead of an upstream prompt template');
+  }
+
   // Shared upstream accounts cannot safely use tools or attachments referencing
   // resources stored on that account. Client-side tools and stateless compaction work.
   const tools = json.tools;
@@ -194,6 +210,9 @@ function assertStatelessInputs(...inputs: unknown[]): void {
       continue;
     }
     const item = value as Record<string, unknown>;
+    if (item.type === 'input_audio' || item.type === 'audio') {
+      throw new AppError(400, 'UNPRICED_REQUEST_OPTION', 'Audio input is not priced by this gateway');
+    }
     if (item.type === 'item_reference' || item.file_id != null || item.type === 'file_id' || item.fileData != null || item.file_data != null
       || (item.type === 'tool_reference') || item.type === 'container_upload') {
       throw new AppError(400, 'STORED_RESOURCE_NOT_SUPPORTED', 'Provide inline inputs instead of an upstream file or item ID');

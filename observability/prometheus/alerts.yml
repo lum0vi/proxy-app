@@ -56,6 +56,24 @@ groups:
         annotations:
           summary: Confirmed orders are still waiting for keys
 
+      - alert: ProviderAccountLowBalance
+        expr: |
+          (proxiapp_provider_account_balance_usd <= proxiapp_provider_account_low_balance_threshold_usd)
+          and on (provider) (proxiapp_provider_account_balance_check_healthy == 1)
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: Provider account {{ $labels.provider }} balance is low
+          description: Top up the provider account. Remaining balance is {{ $value }} USD.
+
+      - alert: ProviderAccountBalanceCheckFailed
+        expr: proxiapp_provider_account_balance_check_healthy == 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: Provider account {{ $labels.provider }} balance is unknown or stale
+          description: Check worker health and provider management credentials.
+
       - alert: UsageRequiresReconciliation
         expr: sum by (provider) (increase(proxiapp_proxy_accounting_anomalies_total[15m])) > 0
         labels: { severity: warning }

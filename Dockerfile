@@ -10,14 +10,22 @@ FROM deps AS build
 COPY . .
 RUN npm run build
 
+FROM ${NODE_IMAGE} AS production-deps
+WORKDIR /app
+COPY package.json package-lock.json* ./
+COPY apps/api/package.json apps/api/package.json
+COPY apps/web/package.json apps/web/package.json
+RUN npm ci --omit=dev --workspace @proxi/api --include-workspace-root \
+    && mkdir -p apps/api/node_modules
+
 FROM ${NODE_IMAGE} AS api
 WORKDIR /app
 ENV NODE_ENV=production
 RUN groupadd --system --gid 1001 nodeapp && useradd --system --uid 1001 --gid nodeapp nodeapp
-COPY --from=build --chown=nodeapp:nodeapp /app/node_modules ./node_modules
+COPY --from=production-deps --chown=nodeapp:nodeapp /app/node_modules ./node_modules
 COPY --from=build --chown=nodeapp:nodeapp /app/package.json ./package.json
 COPY --from=build --chown=nodeapp:nodeapp /app/apps/api/package.json ./apps/api/package.json
-COPY --from=build --chown=nodeapp:nodeapp /app/apps/api/node_modules ./apps/api/node_modules
+COPY --from=production-deps --chown=nodeapp:nodeapp /app/apps/api/node_modules ./apps/api/node_modules
 COPY --from=build --chown=nodeapp:nodeapp /app/apps/api/dist ./apps/api/dist
 COPY --from=build --chown=nodeapp:nodeapp /app/apps/api/migrations ./apps/api/migrations
 USER nodeapp

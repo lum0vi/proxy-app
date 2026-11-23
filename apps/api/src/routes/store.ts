@@ -14,7 +14,9 @@ import type { AuthenticatedRequest } from '../types.js';
 
 const createOrderSchema = z.object({
   productId: z.string().uuid(),
-  paymentProvider: z.enum(['stripe', 'nowpayments', 'mock']),
+  paymentProvider: z.enum(['yookassa', 'nowpayments', 'mock']),
+  paymentCurrency: z.enum(['RUB', 'USDT']).optional(),
+  topUpKeyId: z.string().uuid().optional(),
 });
 
 const passwordSchema = z.object({ password: z.string().min(1).max(200) });
@@ -94,11 +96,14 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
         };
       }),
       paymentMethods: config.salesEnabled ? config.paymentMethods : [],
-      cryptoCurrency: config.paymentMethods.includes('nowpayments') && config.salesEnabled ? config.NOWPAYMENTS_PAY_CURRENCY.toUpperCase() : null,
+      paymentCurrencies: config.salesEnabled ? config.paymentCurrencies : [],
+      cryptoCurrency: config.paymentMethods.includes('nowpayments') && config.salesEnabled ? 'USDT' : null,
+      cryptoNetwork: config.paymentMethods.includes('nowpayments') && config.salesEnabled ? 'TON' : null,
+      currency: 'USDT',
     };
   });
 
-  app.get('/api/price-rates', async () => ({ rates: await getPriceRates() }));
+  app.get('/api/price-rates', async () => ({ rates: config.paymentCurrencies.includes('RUB') ? await getPriceRates() : null }));
 
   app.get('/api/products/:id/estimate', async (request) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
@@ -124,6 +129,7 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
     }), retailMultiplier(price, terms.wholesaleCredits));
     return {
       cost: cost.toFixed(8),
+      currency: 'USDT',
       requestsPerKey: cost.gt(0) ? price.dividedToIntegerBy(cost).toFixed(0) : null,
       longContextApplied: !imageCount && terms.longContextThreshold !== null && usage.inputTokens > terms.longContextThreshold,
       peakApplied: Number(peak) > 1,
@@ -140,11 +146,13 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
   app.get('/api/orders', { preHandler: requireAuth }, async (request) => {
     const userId = (request as AuthenticatedRequest).authUser.id;
     const orders = await sql<Record<string, unknown>[]>`
-      SELECT o.id, o.status, o.payment_provider, o.amount::text, o.currency, o.checkout_url,
+      SELECT o.id, o.status, o.payment_provider, o.amount::text, o.currency,
+        COALESCE(o.credit_amount, o.amount)::text AS credit_amount, o.usdt_rub_rate::text, o.exchange_rate_at, o.checkout_url,
         o.metadata, o.reserved_until, o.paid_at, o.fulfilled_at, o.created_at,
-        o.grant_label AS product_name, ak.id AS api_key_id, ak.key_hint
+        o.grant_label AS product_name, o.top_up_key_id, ak.id AS api_key_id, ak.key_hint
       FROM orders o
-      LEFT JOIN api_keys ak ON ak.order_id = o.id
+      LEFT JOIN api_keys ak ON (o.top_up_key_id IS NULL AND ak.order_id = o.id)
+        OR (o.status = 'FULFILLED' AND ak.id = o.top_up_key_id)
       WHERE o.user_id = ${userId}
       ORDER BY o.created_at DESC
     `;
@@ -155,11 +163,13 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const userId = (request as AuthenticatedRequest).authUser.id;
     const [order] = await sql<Record<string, unknown>[]>`
-      SELECT o.id, o.status, o.payment_provider, o.amount::text, o.currency, o.checkout_url,
+      SELECT o.id, o.status, o.payment_provider, o.amount::text, o.currency,
+        COALESCE(o.credit_amount, o.amount)::text AS credit_amount, o.usdt_rub_rate::text, o.exchange_rate_at, o.checkout_url,
         o.metadata, o.reserved_until, o.paid_at, o.fulfilled_at, o.created_at,
-        o.grant_label AS product_name, ak.id AS api_key_id, ak.key_hint
+        o.grant_label AS product_name, o.top_up_key_id, ak.id AS api_key_id, ak.key_hint
       FROM orders o
-      LEFT JOIN api_keys ak ON ak.order_id = o.id
+      LEFT JOIN api_keys ak ON (o.top_up_key_id IS NULL AND ak.order_id = o.id)
+        OR (o.status = 'FULFILLED' AND ak.id = o.top_up_key_id)
       WHERE o.id = ${params.id} AND o.user_id = ${userId}
     `;
     return { order: assertFound(order, 'ORDER_NOT_FOUND', 'Order not found') };
@@ -188,12 +198,17 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
   app.get('/api/keys', { preHandler: requireAuth }, async (request, reply) => {
     const userId = (request as AuthenticatedRequest).authUser.id;
     const keys = await sql<Record<string, unknown>[]>`
-      SELECT ak.id, ak.label, ak.key_hint, ak.status, ak.credits_total::text, ak.credits_used::text,
-        ak.concurrency_limit, ak.expires_at, ak.last_used_at, ak.created_at,
+      SELECT ak.id, ak.label, ak.key_hint, ak.status, ak.credits_total::text, ak.credits_used::text, ak.currency,
+        ak.concurrency_limit, ak.expires_at, ak.last_used_at, ak.created_at, o.payment_provider = 'mock' AS test_key,
+        ARRAY(
+          SELECT p.id FROM products p JOIN upstream_pools up ON up.id = p.pool_id
+          WHERE p.pool_id = o.pool_id AND p.active AND up.active AND p.duration_days IS NULL
+            AND ak.status IN ('ACTIVE', 'EXHAUSTED') AND ak.expires_at IS NULL
+        ) AS top_up_product_ids,
         ARRAY(SELECT DISTINCT m.model FROM usable_key_models m WHERE m.api_key_id = ak.id ORDER BY m.model) AS models,
         COALESCE((SELECT jsonb_agg(jsonb_build_object('model', m.model, 'protocol', m.protocol) ORDER BY m.model, m.protocol)
           FROM usable_key_models m WHERE m.api_key_id = ak.id), '[]'::jsonb) AS model_options
-      FROM api_keys ak
+      FROM api_keys ak JOIN orders o ON o.id = ak.order_id
       WHERE ak.user_id = ${userId}
       ORDER BY ak.created_at DESC
     `;
@@ -217,7 +232,7 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
     `;
     const usage = rows.slice(0, limit);
     const nextCursor = rows.length > limit ? usage.at(-1)?.id ?? null : null;
-    return reply.header('cache-control', 'private, no-store').send({ usage, nextCursor });
+    return reply.header('cache-control', 'private, no-store').send({ usage, nextCursor, currency: 'USDT' });
   });
 
   app.post('/api/keys/:id/reveal', { preHandler: requireAuth }, async (request, reply) => {
@@ -248,7 +263,7 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
     const rows = await sql<{ id: string }[]>`
       UPDATE api_keys SET key_hash = ${sha256(secret)}, encrypted_key = ${encryptSecret(secret)},
         key_hint = ${keyHint(secret)}, updated_at = now()
-      WHERE id = ${params.id} AND user_id = ${userId} AND status IN ('ACTIVE', 'PAUSED')
+      WHERE id = ${params.id} AND user_id = ${userId} AND status IN ('ACTIVE', 'PAUSED', 'EXHAUSTED')
       RETURNING id
     `;
     assertFound(rows[0], 'KEY_NOT_FOUND', 'Active API key not found');
@@ -258,12 +273,18 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
   app.post('/api/keys/:id/revoke', { preHandler: requireAuth }, async (request, reply) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const userId = (request as AuthenticatedRequest).authUser.id;
-    const rows = await sql<{ id: string }[]>`
-      UPDATE api_keys SET status = 'REVOKED', updated_at = now()
-      WHERE id = ${params.id} AND user_id = ${userId} AND status <> 'REVOKED'
-      RETURNING id
-    `;
-    assertFound(rows[0], 'KEY_NOT_FOUND', 'API key not found');
+    await sql.begin(async (transaction) => {
+      const [key] = await transaction<{ id: string }[]>`
+        SELECT id FROM api_keys WHERE id = ${params.id} AND user_id = ${userId} AND status <> 'REVOKED' FOR UPDATE
+      `;
+      assertFound(key, 'KEY_NOT_FOUND', 'API key not found');
+      const [pending] = await transaction`
+        SELECT id FROM orders WHERE top_up_key_id = ${params.id}
+          AND (status = 'PAID' OR (status = 'PENDING' AND reserved_until > now())) LIMIT 1
+      `;
+      if (pending) throw new AppError(409, 'KEY_TOP_UP_PENDING', 'A top-up is pending for this key');
+      await transaction`UPDATE api_keys SET status = 'REVOKED', updated_at = now() WHERE id = ${params.id}`;
+    });
     return reply.code(204).send();
   });
 }

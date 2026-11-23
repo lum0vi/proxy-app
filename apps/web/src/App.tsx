@@ -13,12 +13,14 @@ import { api, ApiError } from './lib/api';
 import { useAuth, type User } from './lib/auth';
 import { usePreferences, type Locale, type Theme } from './lib/preferences';
 import { useRemote } from './lib/useRemote';
-import { money, type CustomerKey, type ModelOption, type PriceRates, type PaymentMethod, type StoreCatalog } from './lib/store';
+import { money, type CustomerKey, type ModelOption, type PriceRates, type PaymentMethod, type PaymentCurrency, type StoreCatalog } from './lib/store';
 import { connectionSnippets, exampleKey } from './lib/setup';
 import { CodeBlock, CopyButton } from './components/CodeBlock';
 import { ClientSetup } from './components/ClientSetup';
 import { Storefront } from './components/Storefront';
 import { PriceCurrencies } from './components/PriceCurrencies';
+import { ProviderBalances } from './components/ProviderBalances';
+import { AdminUserKeys, ProviderKeys } from './components/ProviderKeys';
 
 type AnyRecord = Record<string, unknown>;
 
@@ -28,6 +30,9 @@ interface Order {
   paymentProvider: string;
   amount: string;
   currency: string;
+  creditAmount: string;
+  usdtRubRate: string | null;
+  exchangeRateAt: string | null;
   checkoutUrl: string | null;
   metadata: Record<string, unknown>;
   reservedUntil: string;
@@ -35,6 +40,7 @@ interface Order {
   fulfilledAt: string | null;
   createdAt: string;
   productName: string;
+  topUpKeyId: string | null;
   apiKeyId: string | null;
   keyHint: string | null;
 }
@@ -133,13 +139,13 @@ const docsCopy = {
     overviewTitle: 'Как устроен сервис',
     overviewText: 'Один ключ открывает доступные модели GPT, Claude, Gemini, Grok, DeepSeek и GPT Image. Выберите модель и её API; расход списывается с общего баланса ключа.',
     nativeTitle: 'API для разных моделей', nativeText: 'Поддерживаются Responses, Chat Completions, Anthropic Messages, Gemini и генерация изображений.',
-    prepaidTitle: 'Разовая покупка', prepaidText: 'Вы платите за выбранный ключ. Автопродления и скрытого ежемесячного списания нет.',
-    safeTitle: 'История расходов', safeText: 'Баланс, срок, число одновременных запросов и списания видны в кабинете.',
+    prepaidTitle: 'Ключ с предоплаченным балансом', prepaidText: 'Выбранная сумма USDT целиком поступает на ключ. Бессрочный ключ можно пополнять по мере расхода.',
+    safeTitle: 'История расходов', safeText: 'Проверяйте остаток и списания по каждому запросу в разделе «Расход».',
     quickTitle: 'Четыре шага до запуска',
     steps: [
       ['Создайте аккаунт', 'Зарегистрируйтесь по почте и откройте «Купить ключ».'],
-      ['Выберите пакет', 'Проверьте цену, срок действия и доступные модели.'],
-      ['Оплатите один раз', 'Используйте карту или криптовалюту. После webhook ключ выдаётся автоматически.'],
+      ['Выберите пакет', 'Проверьте сумму и доступные модели.'],
+      ['Оплатите один раз', 'Оплатите USDT в сети TON. После подтверждения оплаты ключ выдаётся автоматически.'],
       ['Скопируйте ключ', 'Откройте «API-ключи», нажмите «Показать» и сохраните pk_live_… в менеджере секретов.'],
     ],
     codexTitle: 'Подключение Codex',
@@ -151,14 +157,14 @@ const docsCopy = {
     endpointsTitle: 'Поддерживаемые маршруты',
     endpoint: 'Маршрут', purpose: 'Назначение',
     billingTitle: 'Что именно покупает пользователь',
-    billingText: 'Вся сумма покупки поступает на баланс ключа. Запросы ко всем доступным моделям списываются с этого баланса по ставкам ProxyKey.',
-    noticesTitle: 'Уведомления', noticesText: 'Email отправляется после выдачи ключа, при низком остатке и перед истечением срока. Пользователь покупает новый ключ сам — автоматического платежа нет.',
+    billingText: 'Баланс и расход ведутся в USDT. Выбранная сумма целиком поступает на ключ. Оплата принимается в USDT в сети TON; адрес и точная сумма указаны в счёте. Чтобы добавить средства к существующему ключу, откройте «Расход» и нажмите «Пополнить ключ».',
+    noticesTitle: 'Уведомления', noticesText: 'Мы отправляем письмо после выдачи ключа и при низком остатке.',
     walletTitle: 'Данные кошелька', walletText: 'В профиле хранится только публичный адрес для связи с платежом. Seed-фразы и приватные ключи сервис никогда не запрашивает.',
     errorsTitle: 'Типовые ответы API',
     errorRows: [
       ['401 INVALID_API_KEY', 'Ключ отсутствует или неверен.'],
       ['403 API_KEY_INACTIVE', 'Ключ отозван или отключён.'],
-      ['402 CREDITS_EXHAUSTED', 'Prepaid-лимит закончился — нужен новый ключ.'],
+      ['402 CREDITS_EXHAUSTED', 'Баланс закончился. Пополните ключ в кабинете.'],
       ['409 NO_UPSTREAM_CAPACITY', 'У провайдера временно нет свободного места для новой продажи.'],
       ['429 KEY_CONCURRENCY_LIMIT', 'Достигнут лимит одновременных запросов ключа.'],
       ['503 UPSTREAM_UNAVAILABLE', 'Провайдер недоступен; повторите запрос с backoff.'],
@@ -174,13 +180,13 @@ const docsCopy = {
     overviewTitle: 'How the service works',
     overviewText: 'One key unlocks available GPT, Claude, Gemini, Grok, DeepSeek, and GPT Image models. Choose a model and its API; every request draws from the same key balance.',
     nativeTitle: 'APIs for different models', nativeText: 'Use Responses, Chat Completions, Anthropic Messages, Gemini, or image generation.',
-    prepaidTitle: 'One-time purchase', prepaidText: 'You pay for the selected key. There is no hidden monthly charge or automatic renewal.',
-    safeTitle: 'Usage history', safeText: 'See your remaining balance, expiration, concurrent request limit, and charges in the dashboard.',
+    prepaidTitle: 'Key with a prepaid balance', prepaidText: 'The selected USDT amount goes to the key. You can top up a key with no expiration as needed.',
+    safeTitle: 'Usage history', safeText: 'Check your balance and per-request charges under Usage.',
     quickTitle: 'Four steps to start',
     steps: [
       ['Create an account', 'Register with your email and open “Buy a key”.'],
-      ['Choose a package', 'Check the price, expiration, and available models.'],
-      ['Pay once', 'Use a card or crypto. The key is issued automatically after a verified webhook.'],
+      ['Choose a package', 'Check the amount and available models.'],
+      ['Pay once', 'Pay in USDT on the TON network. The key is issued automatically once payment is confirmed.'],
       ['Copy the key', 'Open “API keys”, choose “Reveal”, and store pk_live_… in a secret manager.'],
     ],
     codexTitle: 'Connect Codex',
@@ -191,14 +197,14 @@ const docsCopy = {
     apiText: 'Use GET /v1/models to see the models your key can use, then choose the matching route. For long sessions, send your conversation history or use context compaction if the model supports it.',
     endpointsTitle: 'Supported routes', endpoint: 'Endpoint', purpose: 'Purpose',
     billingTitle: 'What the customer buys',
-    billingText: 'The full purchase amount becomes your API key balance. Requests to all available models draw from this balance at ProxyKey rates.',
-    noticesTitle: 'Notifications', noticesText: 'Email is sent when the key is issued, when its allowance is low, and before expiration. The customer buys another key manually; no automatic payment occurs.',
+    billingText: 'Your balance and usage are in USDT. The selected amount is credited in full. Pay in USDT on TON using the address and exact amount shown on your invoice. To add funds to an existing key, open Usage and choose “Top up key”.',
+    noticesTitle: 'Notifications', noticesText: 'We send an email when the key is issued and when its balance runs low.',
     walletTitle: 'Wallet data', walletText: 'Only a public payment address is stored in the profile. The service never asks for seed phrases or private keys.',
     errorsTitle: 'Common API responses',
     errorRows: [
       ['401 INVALID_API_KEY', 'The key is missing or invalid.'],
       ['403 API_KEY_INACTIVE', 'The key is revoked or disabled.'],
-      ['402 CREDITS_EXHAUSTED', 'The prepaid allowance is exhausted; purchase a new key.'],
+      ['402 CREDITS_EXHAUSTED', 'The balance is exhausted. Top up the key in your dashboard.'],
       ['409 NO_UPSTREAM_CAPACITY', 'The provider has no capacity for another sale.'],
       ['429 KEY_CONCURRENCY_LIMIT', 'The key has reached its concurrent request limit.'],
       ['503 UPSTREAM_UNAVAILABLE', 'The provider is unavailable; retry with backoff.'],
@@ -359,32 +365,39 @@ function formatDate(value: string | null, locale: Locale) {
   return value ? new Intl.DateTimeFormat(locale === 'ru' ? 'ru-RU' : 'en-US', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value)) : '—';
 }
 
-function StatusPill({ status }: { status: string }) { const { t } = usePreferences(); return <span className={`status-pill ${status.toLowerCase()}`}><i/>{status === 'PAID' ? t('paidAwaitingKey') : status}</span>; }
+function StatusPill({ status, topUp = false }: { status: string; topUp?: boolean }) {
+  const { t } = usePreferences();
+  return <span className={`status-pill ${status.toLowerCase()}`}><i/>{status === 'PAID' ? t(topUp ? 'paidAwaitingTopUp' : 'paidAwaitingKey') : status}</span>;
+}
 
 function DashboardOverview() {
   const { t, locale } = usePreferences();
   const keys = useRemote(() => api<{ keys: CustomerKey[] }>('/api/keys'), []);
   const orders = useRemote(() => api<{ orders: Order[] }>('/api/orders'), []);
+  const exchange = useRemote(() => api<{ rates: PriceRates | null }>('/api/price-rates'));
   const active = keys.data?.keys.filter((key) => key.status === 'ACTIVE') ?? [];
   const remaining = active.reduce((sum, key) => sum + Math.max(0, Number(key.creditsTotal) - Number(key.creditsUsed)), 0);
   return <>
     <PageTitle eyebrow="ProxyKey / API" title={t('overview')} action={<Link className="button" to="/dashboard/buy"><Plus size={17}/>{t('buyKey')}</Link>}/>
     <div className="stat-grid">
-      <StatCard icon={KeyRound} label={t('activeKeys')} value={String(active.length)} accent="violet"/>
-      <StatCard icon={Wallet} label={t('remainingCredit')} value={`$${remaining.toFixed(4)}`} accent="green"/>
-      <StatCard icon={Package} label={t('orders')} value={String(orders.data?.orders.length ?? 0)} accent="blue"/>
+      <StatCard icon={KeyRound} label={t('activeKeys')} value={keys.loading || keys.error ? '—' : String(active.length)} accent="violet"/>
+      <StatCard icon={Wallet} label={t('remainingCredit')} value={keys.loading || keys.error ? '—' : money(remaining, locale, 'USDT', 4)} accent="green" detail={!keys.loading && !keys.error && <PriceCurrencies usdt={remaining} rates={exchange.data?.rates ?? null} loading={exchange.loading}/>}/>
+      <StatCard icon={Package} label={t('orders')} value={orders.loading || orders.error ? '—' : String(orders.data?.orders.length ?? 0)} accent="blue"/>
     </div>
     <section className="panel"><div className="panel-head"><h2>{t('keys')}</h2><Link to="/dashboard/keys">{t('keys')} <ArrowRight size={15}/></Link></div>
-      {keys.loading ? <Loading/> : active.length === 0 ? <EmptyState icon={KeyRound} text={t('buyKey')} to="/dashboard/buy"/> : <div className="key-mini-grid">{active.slice(0,3).map((key) => <div className="key-mini" key={key.id}><span><KeyRound/></span><div><b>{key.label}</b><code>{key.keyHint}</code></div><UsageBar used={Number(key.creditsUsed)} total={Number(key.creditsTotal)}/></div>)}</div>}
+      {keys.loading ? <Loading/> : keys.error ? <ErrorState message={keys.error} retry={keys.reload}/> : active.length === 0 ? <EmptyState icon={KeyRound} text={t('buyKey')} to="/dashboard/buy"/> : <div className="key-mini-grid">{active.slice(0,3).map((key) => <div className="key-mini" key={key.id}><span><KeyRound/></span><div><b>{key.label}</b><code>{key.keyHint}</code></div><UsageBar used={Number(key.creditsUsed)} total={Number(key.creditsTotal)}/></div>)}</div>}
     </section>
     <section className="panel"><div className="panel-head"><h2>{t('recentOrders')}</h2><Link to="/dashboard/orders">{t('orders')} <ArrowRight size={15}/></Link></div>
-      <DataTable headers={[t('order'), t('amount'), t('status'), t('created')]} rows={(orders.data?.orders.slice(0,5) ?? []).map((order) => [<Link to={`/dashboard/orders/${order.id}`}>{order.productName}</Link>, `${order.amount} ${order.currency}`, <StatusPill status={order.status}/>, formatDate(order.createdAt, locale)])}/>
+      {orders.loading ? <Loading/> : orders.error ? <ErrorState message={orders.error} retry={orders.reload}/> : <DataTable headers={[t('order'), t('amount'), t('status'), t('created')]} rows={(orders.data?.orders.slice(0,5) ?? []).map((order) => [
+        <Link to={`/dashboard/orders/${order.id}`}>{order.topUpKeyId ? `${t('topUp')} · ${order.productName}` : order.productName}</Link>,
+        money(order.amount, locale, order.currency), <StatusPill status={order.status} topUp={!!order.topUpKeyId}/>, formatDate(order.createdAt, locale),
+      ])}/>}
     </section>
   </>;
 }
 
-function StatCard({ icon: Icon, label, value, accent }: { icon: typeof KeyRound; label: string; value: string; accent: string }) {
-  return <article className="stat-card"><span className={`stat-icon ${accent}`}><Icon/></span><div><p>{label}</p><strong>{value}</strong></div></article>;
+function StatCard({ icon: Icon, label, value, accent, detail }: { icon: typeof KeyRound; label: string; value: string; accent: string; detail?: ReactNode }) {
+  return <article className="stat-card"><span className={`stat-icon ${accent}`}><Icon/></span><div><p>{label}</p><strong>{value}</strong>{detail}</div></article>;
 }
 
 function UsageBar({ used, total }: { used: number; total: number }) {
@@ -400,30 +413,53 @@ function DataTable({ headers, rows }: { headers: string[]; rows: ReactNode[][] }
   return <div className="table-scroll"><table><thead><tr>{headers.map((header) => <th key={header}>{header}</th>)}</tr></thead><tbody>{rows.length ? rows.map((row, index) => <tr key={index}>{row.map((cell, cellIndex) => <td key={cellIndex}>{cell}</td>)}</tr>) : <tr><td colSpan={headers.length}>—</td></tr>}</tbody></table></div>;
 }
 
+function TopUpLink({ apiKey }: { apiKey: CustomerKey }) {
+  const { t } = usePreferences();
+  if (!apiKey.topUpProductIds?.length) return null;
+  return <Link className="button small ghost" to={`/dashboard/buy?${new URLSearchParams({ key: apiKey.id })}`}><Plus size={15}/>{t('topUp')}</Link>;
+}
+
 function KeysPage() {
   const { t, locale } = usePreferences();
+  const exchange = useRemote(() => api<{ rates: PriceRates | null }>('/api/price-rates'));
   const remote = useRemote(() => api<{ keys: CustomerKey[] }>('/api/keys'), []);
   const [action, setAction] = useState<{ key: CustomerKey; type: 'reveal' | 'rotate' } | null>(null);
   const [secret, setSecret] = useState('');
+  const [keyError, setKeyError] = useState('');
   async function secretAction(password: string) {
     if (!action) return;
     const result = await api<{ apiKey: string }>(`/api/keys/${action.key.id}/${action.type}`, { method: 'POST', body: JSON.stringify({ password }) });
     setSecret(result.apiKey); setAction(null); await remote.reload();
   }
+  async function revokeKey(key: CustomerKey) {
+    if (!confirm(t('revoke'))) return;
+    setKeyError('');
+    try {
+      await api(`/api/keys/${key.id}/revoke`, { method: 'POST' });
+      await remote.reload();
+    } catch (cause) {
+      setKeyError(cause instanceof ApiError && cause.code === 'KEY_TOP_UP_PENDING'
+        ? (locale === 'ru' ? 'Дождитесь завершения пополнения, затем отзовите ключ.' : 'Wait for the top-up to finish before revoking this key.')
+        : cause instanceof Error ? cause.message : String(cause));
+    }
+  }
   return <>
     <PageTitle eyebrow="API / Keys" title={t('keys')} action={<Link className="button" to="/dashboard/buy"><Plus size={17}/>{t('buyKey')}</Link>}/>
+    {keyError && <div className="form-error" role="alert">{keyError}</div>}
     {secret && <div className="secret-banner"><div><ShieldCheck/><span><b>API key</b><code>{secret}</code></span></div><CopyButton value={secret}/><button className="icon-button" onClick={() => setSecret('')}><X/></button></div>}
     {remote.loading ? <Loading/> : remote.error ? <ErrorState message={remote.error} retry={remote.reload}/> : <div className="key-grid">{remote.data?.keys.map((key) => {
       const total = Number(key.creditsTotal), used = Number(key.creditsUsed);
       return <article className="api-key-card" key={key.id}><div className="api-key-top"><span className="key-logo"><KeyRound/></span><div><h3>{key.label}</h3></div><StatusPill status={key.status}/></div>
-        <code className="key-hint">{key.keyHint}</code><UsageBar used={used} total={total}/><div className="usage-label"><span>{t('used')} ${used.toFixed(4)}</span><b>${Math.max(0,total-used).toFixed(4)}</b></div>
-        <dl><div><dt>{t('expires')}</dt><dd>{key.expiresAt ? formatDate(key.expiresAt, locale) : t('never')}</dd></div><div><dt>{t('concurrentModelRequests')}</dt><dd>{key.concurrencyLimit}</dd></div></dl>
+        <code className="key-hint">{key.keyHint}</code><UsageBar used={used} total={total}/><div className="usage-label"><span>{t('used')} {money(used, locale, 'USDT', 4)}</span><b>{money(Math.max(0,total-used), locale, 'USDT', 4)}</b></div>
+        <PriceCurrencies usdt={Math.max(0, total-used)} rates={exchange.data?.rates ?? null} loading={exchange.loading}/>
+        <dl><div><dt>{locale === 'ru' ? 'Срок действия' : 'Validity'}</dt><dd>{key.expiresAt ? formatDate(key.expiresAt, locale) : t('noExpiry')}</dd></div><div><dt>{t('concurrentModelRequests')}</dt><dd>{key.concurrencyLimit}</dd></div></dl>
         <div className="card-actions">
           <Link className="button small" to={`/dashboard/keys/${key.id}/setup`}><TerminalSquare size={15}/>{t('connectKey')}</Link>
+          <TopUpLink apiKey={key}/>
           <Link className="button small ghost" to={`/dashboard/usage?key=${key.id}`}><BarChart3 size={15}/>{t('usageHistory')}</Link>
           <button className="button small ghost" onClick={() => setAction({ key, type: 'reveal' })}><Eye size={15}/>{t('reveal')}</button>
           <button className="button small ghost" onClick={() => setAction({ key, type: 'rotate' })}><RefreshCw size={15}/>{t('rotate')}</button>
-          <button className="icon-button danger" title={t('revoke')} onClick={async () => { if (confirm(t('revoke'))) { await api(`/api/keys/${key.id}/revoke`, { method: 'POST' }); await remote.reload(); } }}><X size={16}/></button>
+          {key.status !== 'REVOKED' && <button className="icon-button danger" title={t('revoke')} onClick={() => void revokeKey(key)}><X size={16}/></button>}
         </div>
       </article>;
     })}</div>}
@@ -470,7 +506,7 @@ interface UsageEntry {
   startedAt: string;
 }
 
-function UsageTable({ keyId, before }: { keyId: string; before: string | null }) {
+function UsageTable({ keyId, before, refreshBalance }: { keyId: string; before: string | null; refreshBalance: () => Promise<void> }) {
   const { t, locale } = usePreferences();
   const ru = locale === 'ru';
   const query = before ? `?${new URLSearchParams({ before })}` : '';
@@ -492,12 +528,12 @@ function UsageTable({ keyId, before }: { keyId: string; before: string | null })
           {(entry.cacheWrite5mTokens !== '0' || entry.cacheWrite1hTokens !== '0') && <span>{ru ? 'Записано' : 'Written'}: {count.format(BigInt(entry.cacheWrite5mTokens) + BigInt(entry.cacheWrite1hTokens))}</span>}
         </td>
         <td>{entry.imageCount > 0 ? `${count.format(entry.imageCount)} ${ru ? 'изобр.' : 'images'}` : count.format(BigInt(entry.outputTokens))}</td>
-        <td>{entry.status === 'STARTED' ? '—' : money(entry.cost, locale, 'USD', 8)}</td>
+        <td>{entry.status === 'STARTED' ? '—' : money(entry.cost, locale, 'USDT', 8)}</td>
         <td>{statuses[entry.status]}{entry.errorCode && <code>{entry.errorCode}</code>}</td>
       </tr>)}</tbody>
     </table></div> : <p className="store-muted">{ru ? 'В этой выборке пока нет запросов.' : 'No requests on this page yet.'}</p>}
     <div className="card-actions usage-pagination">
-      <button className="button small ghost" type="button" onClick={() => void remote.reload()}><RefreshCw size={15}/>{t('refresh')}</button>
+      <button className="button small ghost" type="button" onClick={() => void Promise.all([remote.reload(), refreshBalance()])}><RefreshCw size={15}/>{t('refresh')}</button>
       {before && <Link className="button small ghost" to={`/dashboard/usage?${new URLSearchParams({ key: keyId })}`}>{ru ? 'К новым запросам' : 'Newest requests'}</Link>}
       {next && <Link className="button small ghost" to={`/dashboard/usage?${new URLSearchParams({ key: keyId, before: next })}`}>{ru ? 'Более ранние' : 'Older requests'}<ArrowRight size={15}/></Link>}
     </div>
@@ -506,6 +542,7 @@ function UsageTable({ keyId, before }: { keyId: string; before: string | null })
 
 function UsagePage() {
   const { t, locale } = usePreferences();
+  const exchange = useRemote(() => api<{ rates: PriceRates | null }>('/api/price-rates'));
   const ru = locale === 'ru';
   const navigate = useNavigate();
   const { search } = useLocation();
@@ -515,14 +552,15 @@ function UsagePage() {
   const before = key?.id === selection.get('key') ? selection.get('before') : null;
   return <>
     <PageTitle title={ru ? 'Расход по ключу' : 'Usage by key'} action={<Link className="button ghost" to="/dashboard/keys"><KeyRound size={16}/>{t('keys')}</Link>}/>
-    {remote.loading ? <Loading/> : remote.error ? <ErrorState message={remote.error} retry={remote.reload}/> : key ? <section className="panel">
+    {remote.loading && !remote.data ? <Loading/> : remote.error ? <ErrorState message={remote.error} retry={remote.reload}/> : key ? <section className="panel">
       <div className="usage-heading">
         <label className="field"><span>{t('apiKey')}</span><select value={key.id} onChange={(event) => navigate(`/dashboard/usage?${new URLSearchParams({ key: event.target.value })}`)}>
           {remote.data?.keys.map((item) => <option key={item.id} value={item.id}>{item.label} · {item.keyHint}</option>)}
         </select></label>
-        <div><span>{t('remainingCredit')}</span><strong>{money(Math.max(0, Number(key.creditsTotal) - Number(key.creditsUsed)), locale, 'USD', 8)}</strong></div>
+        <div><span>{t('remainingCredit')}</span><strong>{money(Math.max(0, Number(key.creditsTotal) - Number(key.creditsUsed)), locale, 'USDT', 8)}</strong><PriceCurrencies usdt={Math.max(0, Number(key.creditsTotal) - Number(key.creditsUsed))} rates={exchange.data?.rates ?? null} loading={exchange.loading}/></div>
+        <TopUpLink apiKey={key}/>
       </div>
-      <UsageTable key={`${key.id}/${before ?? ''}`} keyId={key.id} before={before}/>
+      <UsageTable key={`${key.id}/${before ?? ''}`} keyId={key.id} before={before} refreshBalance={remote.reload}/>
     </section> : <EmptyState icon={BarChart3} text={t('buyKey')} to="/dashboard/buy"/>}
   </>;
 }
@@ -532,70 +570,135 @@ function BuyPage() {
   const ru = locale === 'ru';
   const navigate = useNavigate();
   const { search } = useLocation();
+  const selection = new URLSearchParams(search);
+  const topUpKeyId = selection.get('key');
+  const toppingUp = topUpKeyId !== null;
   const catalog = useRemote(() => api<StoreCatalog>('/api/products'));
   const exchange = useRemote(() => api<{ rates: PriceRates | null }>('/api/price-rates'));
-  const products = catalog.data?.products ?? [];
-  const methods = catalog.data?.paymentMethods ?? [];
+  const keys = useRemote(() => toppingUp ? api<{ keys: CustomerKey[] }>('/api/keys') : Promise.resolve({ keys: [] }), [toppingUp]);
+  const key = keys.data?.keys.find((item) => item.id === topUpKeyId);
+  const products = (catalog.data?.products ?? []).filter((item) => !toppingUp || key?.topUpProductIds?.includes(item.id));
+  const enabledMethods = (catalog.data?.paymentMethods ?? []).filter((item) => !toppingUp || (item === 'mock') === key?.testKey);
+  const supportsCurrency = (method: PaymentMethod, currency: PaymentCurrency) => method === 'mock'
+    || (currency === 'RUB' ? method === 'yookassa' : method === 'nowpayments');
+  const currencies = (catalog.data?.paymentCurrencies ?? []).filter(currency => enabledMethods.some(method => supportsCurrency(method, currency)));
+  const [chosenCurrency, setChosenCurrency] = useState<PaymentCurrency>();
+  const preferredCurrency = ru ? 'RUB' : 'USDT';
+  const currency = chosenCurrency && currencies.includes(chosenCurrency) ? chosenCurrency
+    : currencies.includes(preferredCurrency) ? preferredCurrency : currencies[0] ?? preferredCurrency;
+  const methods = enabledMethods.filter(method => supportsCurrency(method, currency));
   const [chosenMethod, setChosenMethod] = useState<PaymentMethod>();
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  const selection = new URLSearchParams(search).get('product');
-  const product = products.find((item) => item.id === selection) ?? products.find((item) => item.inventory > 0) ?? products[0];
-  const method = chosenMethod && methods.includes(chosenMethod) ? chosenMethod : methods[0];
-  const cryptoCurrency = catalog.data?.cryptoCurrency;
+  const product = products.find((item) => item.id === selection.get('product'))
+    ?? products.find((item) => toppingUp || item.inventory > 0) ?? products[0];
+  const available = product && (toppingUp || product.inventory > 0);
+  const method = chosenMethod && methods.includes(chosenMethod) ? chosenMethod : methods.find(item => item !== 'mock') ?? methods[0];
+  const rate = Number(exchange.data?.rates?.usdtToRub);
+  const rubRate = !exchange.error && Number.isFinite(rate) && rate > 0 ? rate : null;
+  const needsRate = currency === 'RUB' && rubRate === null;
+  const paymentAmount = (usdt: string) => currency === 'RUB'
+    ? rubRate === null ? '—' : `≈ ${money(Number(usdt) * rubRate, locale, 'RUB')}`
+    : money(usdt, locale);
 
   async function purchase() {
-    if (!product || product.inventory < 1 || !method || busy) return;
+    if (!product || !available || !method || busy || needsRate || (toppingUp && !key)) return;
     setBusy(true);
     setError('');
     try {
       const { order } = await api<{ order: Order }>('/api/orders', {
-        method: 'POST', body: JSON.stringify({ productId: product.id, paymentProvider: method }),
+        method: 'POST', body: JSON.stringify({ productId: product.id, paymentProvider: method, paymentCurrency: currency, topUpKeyId: key?.id }),
       });
       if (order.checkoutUrl && new URL(order.checkoutUrl, window.location.origin).origin !== window.location.origin) {
         window.location.assign(order.checkoutUrl);
       } else navigate(`/dashboard/orders/${order.id}`);
     } catch (cause) {
       if (cause instanceof ApiError && cause.code === 'NO_UPSTREAM_CAPACITY') {
-        setError(ru ? 'Свободные места закончились. Обновите наличие.' : 'This package just sold out. Refresh availability.');
+        setError(toppingUp
+          ? (ru ? 'Для этой суммы сейчас нет свободной ёмкости. Выберите меньшую сумму или попробуйте позже.' : 'Capacity is temporarily unavailable for this amount. Choose a smaller amount or try again later.')
+          : (ru ? 'Свободные места закончились. Обновите наличие.' : 'This package just sold out. Refresh availability.'));
+      } else if (cause instanceof ApiError && cause.code === 'EXCHANGE_RATE_UNAVAILABLE') {
+        setError(ru ? 'Свежий курс USDT / ₽ недоступен. Повторите позже или выберите оплату USDT.' : 'A fresh USDT / RUB rate is unavailable. Try later or pay in USDT.');
       } else if (cause instanceof ApiError && cause.code === 'PAYMENT_PROVIDER_ERROR') {
         setError(ru ? 'Платёжная система не смогла выставить счёт. Проверьте способ оплаты или выберите другой пакет.' : 'The payment processor could not create an invoice. Check the payment method or choose another package.');
+      } else if (cause instanceof ApiError && cause.code === 'PAYMENT_PROVIDER_UNAVAILABLE') {
+        setError(ru ? 'Платёжная система временно недоступна. Счёт не получен — попробуйте позже.' : 'The payment processor is temporarily unavailable. No invoice was received — please try again later.');
       } else setError(cause instanceof Error ? cause.message : String(cause));
     } finally { setBusy(false); }
   }
 
-  return <><PageTitle title={t('buyKey')}/>
-    {catalog.loading ? <Loading/> : catalog.error ? <ErrorState message={catalog.error} retry={catalog.reload}/> : <div className="checkout-layout">
-      <div><div className="selectable-products">{products.map((item) => <button type="button" key={item.id} className={product?.id === item.id ? 'selected' : ''}
-        onClick={() => { setError(''); navigate(`/dashboard/buy?${new URLSearchParams({ product: item.id })}`, { replace: true }); }}>
-        <span><Package/>{item.inventory > 0 ? (ru ? 'Доступен' : 'Available') : (ru ? 'Нет мест' : 'Unavailable')}</span>
-        <b>{item.name}</b><strong>{money(item.retailPrice, locale)}</strong>
+  return <><PageTitle title={t(toppingUp ? 'topUp' : 'buyKey')} eyebrow={key ? `${key.label} · ${key.keyHint}` : undefined}/>
+    {catalog.loading || (toppingUp && keys.loading) ? <Loading/> : catalog.error ? <ErrorState message={catalog.error} retry={catalog.reload}/>
+      : toppingUp && keys.error ? <ErrorState message={keys.error} retry={keys.reload}/>
+      : products.length === 0 ? <section className="panel"><p>{toppingUp
+        ? (ru ? 'Сейчас для этого ключа нет доступных пакетов пополнения.' : 'There are no top-up packages available for this key.')
+        : (ru ? 'Пакеты пока не опубликованы.' : 'Packages have not been published yet.')}</p>
+        {toppingUp && <Link className="button ghost" to="/dashboard/usage">{t('usageHistory')}</Link>}</section>
+      : <div className="checkout-layout">
+      <div>
+      {currencies.length > 1 && <section className="panel checkout-currency"><h2>{ru ? 'Валюта оплаты' : 'Payment currency'}</h2>
+        <div className="segmented" role="group" aria-label={ru ? 'Валюта оплаты' : 'Payment currency'}>
+          {currencies.map(value => <button key={value} type="button" className={currency === value ? 'active' : ''}
+            aria-pressed={currency === value} disabled={busy || !currencies.includes(value)} onClick={() => { setChosenCurrency(value); setError(''); }}>
+            {value === 'RUB' ? (ru ? '₽ · Рубли' : '₽ · RUB') : 'USDT'}
+          </button>)}
+        </div>
+      </section>}
+      <div className="selectable-products">{products.map((item) => <button type="button" key={item.id} className={product?.id === item.id ? 'selected' : ''} disabled={busy}
+        aria-pressed={item.id === product?.id} onClick={() => {
+          setError('');
+          selection.set('product', item.id);
+          navigate(`/dashboard/buy?${selection}`, { replace: true });
+        }}>
+        <span><Package/>{toppingUp ? (ru ? 'Пополнение' : 'Top-up') : item.inventory > 0 ? (ru ? 'Доступен' : 'Available') : (ru ? 'Нет мест' : 'Unavailable')}</span>
+        <b>{item.name}</b><strong>{paymentAmount(item.retailPrice)}</strong>
+        {currency === 'RUB' && <small>{ru ? 'На баланс: ' : 'Balance credit: '}{money(item.retailPrice, locale)}</small>}
       </button>)}</div>
       <section className="panel payment-panel"><h2>{t('paymentMethod')}</h2>
-        {methods.length === 0 ? <p className="store-muted">{ru ? 'Оплата пока отключена.' : 'Payments are currently disabled.'}</p> : <div className="payment-options">{methods.map((item) => <button type="button" className={method === item ? 'selected' : ''} aria-pressed={method === item} onClick={() => setChosenMethod(item)} key={item}>
-          {item === 'stripe' ? <CreditCard/> : item === 'nowpayments' ? <Wallet/> : <Zap/>}<span>
-            <b>{item === 'stripe' ? t('card') : item === 'nowpayments' ? cryptoCurrency ?? t('crypto') : t('testPayment')}</b>
-            <small>{item === 'stripe' ? 'Stripe · USD' : item === 'nowpayments' ? 'NOWPayments' : (ru ? 'Локальная проверка' : 'Local testing')}</small>
+        {methods.length === 0 ? <p className="store-muted">{ru ? 'Оплата пока отключена.' : 'Payments are currently disabled.'}</p> : <div className="payment-options">{methods.map((item) => <button type="button" className={method === item ? 'selected' : ''} disabled={busy} aria-pressed={method === item} onClick={() => { setChosenMethod(item); setError(''); }} key={item}>
+          {item === 'yookassa' ? <CreditCard/> : item === 'nowpayments' ? <Wallet/> : <Zap/>}<span>
+            <b>{item === 'yookassa' ? (ru ? 'Карта / СБП' : 'Card / SBP') : item === 'nowpayments' ? 'USDT' : `${currency === 'RUB' ? (ru ? 'Рубли' : 'RUB') : 'USDT'} · ${t('testPayment')}`}</b>
+            <small>{item === 'yookassa' ? 'ЮKassa · ₽' : item === 'nowpayments' ? 'USDT · TON' : (ru ? 'Без списания денег' : 'No money is charged')}</small>
           </span><i/>
         </button>)}</div>}
       </section></div>
       {product && <aside className="order-summary"><h2>{product.name}</h2>
-        <dl><div><dt>{ru ? 'Срок с выдачи' : 'Valid after issuance'}</dt><dd>{product.durationDays ? `${product.durationDays} ${t('days')}` : t('noExpiry')}</dd></div>
+        {toppingUp ? <p>{ru ? 'Вся сумма поступит на баланс выбранного ключа. Продолжайте пользоваться теми же настройками.' : 'The full payment goes to the selected key balance. Keep using the same client settings.'}</p>
+        : <><dl><div><dt>{ru ? 'Срок действия' : 'Validity'}</dt><dd>{product.durationDays ? `${product.durationDays} ${t('days')}` : t('noExpiry')}</dd></div>
           <div><dt>{t('concurrentModelRequests')}</dt><dd>{product.concurrencyLimit}</dd></div>
         </dl>
-        <p>{t('concurrentRequestHelp')}</p>
-        <div className="summary-total"><span>{t('amount')}</span><strong>{money(product.retailPrice, locale)} <small>USD</small></strong></div>
-        <PriceCurrencies usd={product.retailPrice} rates={exchange.data?.rates ?? null} loading={exchange.loading}/>
-        {method === 'nowpayments' && <p>{ru ? 'Точная сумма и адрес будут в счёте.' : 'The invoice will show the exact amount and address.'}</p>}
+        <p>{ru ? 'Разовая оплата. Вся сумма поступит на баланс нового ключа.' : 'One-time payment. The full amount goes to the new key balance.'}</p></>}
+        <div className="summary-total"><span>{ru ? 'К оплате' : 'Amount to pay'}</span><strong>{paymentAmount(product.retailPrice)}</strong></div>
+        <div className="summary-credit"><span>{ru ? 'На баланс ключа' : 'Key balance credit'}</span><b>{money(product.retailPrice, locale)}</b></div>
+        {currency === 'RUB' && (needsRate ? <div className="checkout-rate-error" role="status">
+          <p>{exchange.loading ? (ru ? 'Загружаем курс USDT / ₽…' : 'Loading the USDT / RUB rate…')
+            : (ru ? 'Курс USDT / ₽ недоступен. Обновите курс или выберите USDT.' : 'The USDT / RUB rate is unavailable. Refresh the rate or choose USDT.')}</p>
+        </div> : <p>{ru ? 'Показана ориентировочная сумма. Точные сумма в рублях и курс фиксируются при создании счёта. Баланс зачисляется в USDT.' : 'This is an indicative amount. The exact RUB amount and exchange rate are locked when the invoice is created. Your balance is credited in USDT.'}</p>)}
+        {currency === 'RUB' && <button className="button small ghost checkout-rate-refresh" type="button" disabled={busy || exchange.loading} onClick={() => { setError(''); void exchange.reload(); }}><RefreshCw size={15}/>{ru ? 'Обновить курс' : 'Refresh rate'}</button>}
+        {method === 'mock' && <div className="info-box"><p>{ru ? 'Тестовый заказ: деньги не списываются. Ключ или пополнение выдаются после тестового подтверждения.' : 'Test order: no money is charged. The key or balance credit is issued after test confirmation.'}</p></div>}
+        {method === 'nowpayments' && <p>{ru ? 'Отправьте USDT в сети TON. Адрес и точная сумма будут в счёте. Комиссия сети оплачивается отдельно.' : 'Send USDT on the TON network. The invoice provides the address and exact amount. Network fees are separate.'}</p>}
         {error && <div className="form-error" role="alert">{error}</div>}
-        {product.inventory < 1 ? <button className="button wide ghost" type="button" onClick={() => void catalog.reload()}><RefreshCw size={16}/>{ru ? 'Проверить наличие' : 'Refresh availability'}</button>
-          : <button className="button wide large" type="button" disabled={busy || !method} onClick={() => void purchase()}>{busy ? t('loading') : t('continuePayment')}<ArrowRight size={17}/></button>}
+        {!available ? <button className="button wide ghost" type="button" onClick={() => void catalog.reload()}><RefreshCw size={16}/>{ru ? 'Проверить наличие' : 'Refresh availability'}</button>
+          : <button className="button wide large" type="button" disabled={busy || !method || needsRate} onClick={() => void purchase()}>{busy ? t('loading') : method === 'mock' ? (ru ? 'Создать тестовый счёт' : 'Create test invoice') : t('continuePayment')}<ArrowRight size={17}/></button>}
       </aside>}
     </div>}
   </>;
 }
 
-function OrdersPage(){const{t,locale}=usePreferences();const remote=useRemote(()=>api<{orders:Order[]}>('/api/orders'),[]);return <><PageTitle eyebrow="Billing / Orders" title={t('orders')}/>{remote.loading?<Loading/>:remote.error?<ErrorState message={remote.error}/>:<section className="panel"><DataTable headers={[t('order'),t('paymentMethod'),t('amount'),t('status'),t('created')]} rows={(remote.data?.orders??[]).map(order=>[<Link to={`/dashboard/orders/${order.id}`}>{order.productName}</Link>,order.paymentProvider,`${order.amount} ${order.currency}`,<StatusPill status={order.status}/>,formatDate(order.createdAt,locale)])}/></section>}</>}
+function OrdersPage() {
+  const { t, locale } = usePreferences();
+  const remote = useRemote(() => api<{ orders: Order[] }>('/api/orders'), []);
+  return <>
+    <PageTitle title={t('orders')}/>
+    {remote.loading ? <Loading/> : remote.error ? <ErrorState message={remote.error} retry={remote.reload}/> : <section className="panel">
+      <DataTable headers={[t('order'), t('paymentMethod'), t('amount'), t('status'), t('created')]} rows={(remote.data?.orders ?? []).map((order) => [
+        <Link to={`/dashboard/orders/${order.id}`}>{order.topUpKeyId ? `${t('topUp')} · ${order.productName}` : order.productName}</Link>,
+        order.paymentProvider, money(order.amount, locale, order.currency),
+        <StatusPill status={order.status} topUp={!!order.topUpKeyId}/>, formatDate(order.createdAt, locale),
+      ])}/>
+    </section>}
+  </>;
+}
 
 function OrderPage() {
   const { id } = useParams();
@@ -612,6 +715,8 @@ function OrderPage() {
   }, [refresh, reload]);
   if (remote.loading && !order) return <Loading/>;
   if (remote.error || !order) return <ErrorState message={remote.error ?? 'Not found'} retry={reload}/>;
+  const ru = locale === 'ru';
+  const toppingUp = !!order.topUpKeyId;
   const meta = order.metadata;
   const crypto = order.paymentProvider === 'nowpayments';
   const invoiceDates = [Date.parse(order.reservedUntil)];
@@ -622,20 +727,25 @@ function OrderPage() {
   const invoiceDeadline = Math.min(...invoiceDates);
   const pending = order.status === 'PENDING' && invoiceDeadline > Date.now();
   return <>
-    <PageTitle eyebrow={`Billing / ${order.id.slice(0, 8)}`} title={order.productName} action={<StatusPill status={order.status}/>}/>
+    <PageTitle eyebrow={order.id.slice(0, 8)} title={toppingUp ? `${t('topUp')} · ${order.productName}` : order.productName}
+      action={<StatusPill status={order.status} topUp={toppingUp}/>}/>
     <div className="order-detail">
       <section className="panel">
         <h2>{t('order')}</h2>
         <dl className="detail-list">
           <div><dt>ID</dt><dd><code>{order.id}</code></dd></div>
-          <div><dt>{t('amount')}</dt><dd>{order.amount} {order.currency}</dd></div>
+          <div><dt>{t('amount')}</dt><dd>{money(order.amount, locale, order.currency)}</dd></div>
+          <div><dt>{ru ? 'На баланс ключа' : 'Key balance credit'}</dt><dd>{money(order.creditAmount, locale)}</dd></div>
+          {order.usdtRubRate && <div><dt>{ru ? 'Курс счёта' : 'Invoice exchange rate'}</dt><dd>1 USDT = {money(order.usdtRubRate, locale, 'RUB', 8)}</dd></div>}
           <div><dt>{t('paymentMethod')}</dt><dd>{order.paymentProvider}</dd></div>
           <div><dt>{t('created')}</dt><dd>{formatDate(order.createdAt, locale)}</dd></div>
         </dl>
-        {order.status === 'PAID' && <div className="info-box"><Activity/><p>{t('paidAwaitingKeyHint')}</p></div>}
+        {order.paymentProvider === 'mock' ? <div className="info-box"><p>{ru ? 'Локальный тестовый счёт. Реальные деньги не списываются.' : 'Local test invoice. No real money is charged.'}</p></div>
+          : meta.testPayment === true && <div className="info-box"><p>{ru ? 'Тестовый платёж ЮKassa — реальные деньги не списываются.' : 'YooKassa test payment — no real money is charged.'}</p></div>}
+        {order.status === 'PAID' && <div className="info-box"><Activity/><p>{t(toppingUp ? 'paidAwaitingTopUpHint' : 'paidAwaitingKeyHint')}</p></div>}
         {actionError && <div className="form-error">{actionError}</div>}
         <div className="card-actions">
-          {pending && order.checkoutUrl && order.paymentProvider === 'stripe' && <a className="button" href={order.checkoutUrl}>{t('continuePayment')}<ArrowRight size={16}/></a>}
+          {pending && order.checkoutUrl && ['yookassa', 'stripe'].includes(order.paymentProvider) && <a className="button" href={order.checkoutUrl}>{t('continuePayment')}<ArrowRight size={16}/></a>}
           {pending && order.paymentProvider === 'mock' && <button className="button" onClick={async () => {
             setActionError('');
             try { await api(`/api/payments/mock/${order.id}/complete`, { method: 'POST' }); await remote.reload(); }
@@ -648,19 +758,95 @@ function OrderPage() {
       {pending && crypto && !!meta.payAddress && <section className="panel crypto-invoice">
         <Wallet/><h2>{t('crypto')}</h2>
         {Boolean(meta.network) && <><p>{t('network')}</p><strong>{String(meta.network)}</strong></>}
-        <p>{t('payAmount')}</p><strong>{String(meta.payAmount ?? '')} {String(meta.payCurrency ?? '').toUpperCase()}</strong>
+        <p>{t('payAmount')}</p><strong>{String(meta.payAmount ?? '')} {String(meta.asset ?? meta.payCurrency ?? '').toUpperCase()}</strong>
         <p>{t('payAddress')}</p><code>{String(meta.payAddress)}</code><CopyButton value={String(meta.payAddress)}/>
         {Boolean(meta.payinExtraId) && <><p>Memo / tag</p><code>{String(meta.payinExtraId)}</code><CopyButton value={String(meta.payinExtraId)}/></>}
         <p>{t('expires')} {formatDate(new Date(invoiceDeadline).toISOString(), locale)}</p>
       </section>}
-      {order.apiKeyId && <section className="panel success-panel"><ShieldCheck/><h2>{t('keys')}</h2><p>{order.keyHint}</p><div className="card-actions"><Link className="button" to={`/dashboard/keys/${order.apiKeyId}/setup`}>{t('connectKey')}<ArrowRight size={16}/></Link><Link className="button ghost" to="/dashboard/keys">{t('keys')}</Link></div></section>}
+      {order.apiKeyId && <section className="panel success-panel">
+        <ShieldCheck/>
+        <h2>{toppingUp ? (ru ? 'Баланс пополнен' : 'Balance topped up') : (ru ? 'Ключ готов' : 'Your key is ready')}</h2>
+        <p>{toppingUp
+          ? (ru ? `${money(order.creditAmount, locale)} зачислено на ключ ${order.keyHint}.` : `${money(order.creditAmount, locale)} added to key ${order.keyHint}.`)
+          : order.keyHint}</p>
+        <div className="card-actions">
+          {toppingUp ? <Link className="button" to={`/dashboard/usage?${new URLSearchParams({ key: order.apiKeyId })}`}>{t('usageHistory')}<ArrowRight size={16}/></Link>
+            : <Link className="button" to={`/dashboard/keys/${order.apiKeyId}/setup`}>{t('connectKey')}<ArrowRight size={16}/></Link>}
+          <Link className="button ghost" to="/dashboard/keys">{t('keys')}</Link>
+        </div>
+      </section>}
     </div>
   </>;
 }
 
-function ProfilePage(){const{t,locale,setLocale,theme,setTheme}=usePreferences();const{user,refresh}=useAuth();const[message,setMessage]=useState('');async function submit(event:FormEvent<HTMLFormElement>){event.preventDefault();const form=new FormData(event.currentTarget);await api('/api/profile',{method:'PATCH',body:JSON.stringify({name:String(form.get('name')),walletNetwork:String(form.get('walletNetwork'))||null,walletAddress:String(form.get('walletAddress'))||null,locale,theme})});await refresh();setMessage('✓');}return <><PageTitle eyebrow="Account / Profile" title={t('profile')}/><form className="profile-grid" onSubmit={submit}><section className="panel"><h2>{t('profile')}</h2><Field label={t('name')} name="name" defaultValue={user?.name??''} required/><Field label={t('email')} name="email" defaultValue={user?.email??''} disabled/><h3>{t('language')}</h3><div className="segmented"><button type="button" className={locale==='ru'?'active':''} onClick={()=>setLocale('ru')}>Русский</button><button type="button" className={locale==='en'?'active':''} onClick={()=>setLocale('en')}>English</button></div><h3>{t('theme')}</h3><div className="segmented">{(['SYSTEM','LIGHT','DARK']as Theme[]).map(value=><button type="button" className={theme===value?'active':''} onClick={()=>setTheme(value)} key={value}>{value==='SYSTEM'?<Settings2/>:value==='LIGHT'?<Sun/>:<Moon/>}{t(value.toLowerCase())}</button>)}</div></section><section className="panel"><h2>{t('wallet')}</h2><div className="info-box"><ShieldCheck/><p>{t('walletHint')}</p></div><Field label={t('network')} name="walletNetwork" defaultValue={user?.walletNetwork??''} placeholder="TRC20 / ERC20 / SOL"/><Field label={t('walletAddress')} name="walletAddress" defaultValue={user?.walletAddress??''}/><button className="button">{t('save')} {message}</button></section></form></>}
+function ProfilePage() {
+  const { t, locale, setLocale, theme, setTheme } = usePreferences();
+  const { user, refresh } = useAuth();
+  const [message, setMessage] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (busy) return;
+    setMessage(''); setError('');
+    const form = new FormData(event.currentTarget);
+    const walletNetwork = String(form.get('walletNetwork')).trim();
+    const walletAddress = String(form.get('walletAddress')).trim();
+    if (Boolean(walletNetwork) !== Boolean(walletAddress)) {
+      setError(locale === 'ru' ? 'Укажите сеть и адрес кошелька вместе или оставьте оба поля пустыми.' : 'Enter both the wallet network and address, or leave both fields empty.');
+      return;
+    }
+    setBusy(true);
+    try {
+      await api('/api/profile', { method: 'PATCH', body: JSON.stringify({
+        name: String(form.get('name')).trim(), walletNetwork: walletNetwork || null,
+        walletAddress: walletAddress || null, locale, theme,
+      }) });
+      await refresh();
+      setMessage(locale === 'ru' ? 'Профиль сохранён.' : 'Profile saved.');
+    } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+    finally { setBusy(false); }
+  }
+  return <><PageTitle eyebrow="Account / Profile" title={t('profile')}/>
+    <form className="profile-grid" onSubmit={submit} onChange={() => setMessage('')}>
+      <section className="panel"><h2>{t('profile')}</h2>
+        <Field label={t('name')} name="name" defaultValue={user?.name ?? ''} required minLength={2} maxLength={100}/>
+        <Field label={t('email')} name="email" defaultValue={user?.email ?? ''} disabled/>
+        <h3>{t('language')}</h3><div className="segmented">
+          <button type="button" className={locale === 'ru' ? 'active' : ''} onClick={() => { setLocale('ru'); setMessage(''); }}>Русский</button>
+          <button type="button" className={locale === 'en' ? 'active' : ''} onClick={() => { setLocale('en'); setMessage(''); }}>English</button>
+        </div>
+        <h3>{t('theme')}</h3><div className="segmented">{(['SYSTEM','LIGHT','DARK'] as Theme[]).map(value =>
+          <button type="button" className={theme === value ? 'active' : ''} onClick={() => { setTheme(value); setMessage(''); }} key={value}>
+            {value === 'SYSTEM' ? <Settings2/> : value === 'LIGHT' ? <Sun/> : <Moon/>}{t(value.toLowerCase())}
+          </button>)}</div>
+      </section>
+      <section className="panel"><h2>{t('wallet')}</h2><div className="info-box"><ShieldCheck/><p>{t('walletHint')}</p></div>
+        <Field label={t('network')} name="walletNetwork" defaultValue={user?.walletNetwork ?? ''} placeholder="TON (USDT)" maxLength={50}/>
+        <Field label={t('walletAddress')} name="walletAddress" defaultValue={user?.walletAddress ?? ''} maxLength={256}/>
+        {error && <p className="form-error" role="alert">{error}</p>}
+        {message && <p role="status">{message}</p>}
+        <button className="button" disabled={busy}>{busy ? t('loading') : t('save')}</button>
+      </section>
+    </form>
+  </>;
+}
 
-function AdminOverview(){const{t}=usePreferences();const remote=useRemote(()=>api<{stats:Record<string,string|number>}>('/api/admin/stats'),[]);const s=remote.data?.stats;return <><PageTitle eyebrow="Operations / Admin" title={t('overview')}/>{remote.loading?<Loading/>:<div className="stat-grid admin-stats"><StatCard icon={Users} label={t('users')} value={String(s?.users??0)} accent="blue"/><StatCard icon={KeyRound} label={t('activeKeys')} value={String(s?.activeKeys??0)} accent="violet"/><StatCard icon={CircleDollarSign} label={t('revenue')} value={`$${s?.grossRevenue??0}`} accent="green"/><StatCard icon={Gauge} label={t('upstreamCost')} value={`$${s?.wholesaleCost??0}`} accent="orange"/><StatCard icon={Package} label={t('pending')} value={String(s?.pendingOrders??0)} accent="blue"/></div>}</>}
+function AdminOverview() {
+  const { t, locale } = usePreferences();
+  const remote = useRemote(() => api<{ stats: Record<string, string | number> }>('/api/admin/stats'));
+  const stats = remote.data?.stats;
+  return <><PageTitle eyebrow="Operations / Admin" title={t('overview')}/>
+    {remote.loading ? <Loading/> : remote.error ? <ErrorState message={remote.error} retry={remote.reload}/> : <div className="stat-grid admin-stats">
+      <StatCard icon={Users} label={t('users')} value={String(stats?.users ?? 0)} accent="blue"/>
+      <StatCard icon={KeyRound} label={t('activeKeys')} value={String(stats?.activeKeys ?? 0)} accent="violet"/>
+      <StatCard icon={CircleDollarSign} label={t('revenue')} value={money(stats?.grossRevenue ?? 0, locale)} accent="green"/>
+      <StatCard icon={Gauge} label={t('upstreamCost')} value={money(stats?.wholesaleCost ?? 0, locale, 'USD')} accent="orange"/>
+      <StatCard icon={Package} label={t('pending')} value={String(stats?.pendingOrders ?? 0)} accent="blue"/>
+    </div>}
+    <ProviderBalances/>
+  </>;
+}
 
 function AdminProviders() {
   const { t, locale } = usePreferences();
@@ -723,6 +909,8 @@ function AdminProviders() {
 
   return <>
     <PageTitle eyebrow="Routing / Providers" title={t('providers')}/>
+    <ProviderBalances/>
+    <ProviderKeys/>
     {error && <div className="form-error">{error}</div>}
     <div className="admin-form-grid">
       <form className="panel compact-form" onSubmit={addPool}>
@@ -779,11 +967,110 @@ function AdminProviders() {
   </>;
 }
 
-function AdminProducts(){const{t}=usePreferences();const products=useRemote(()=>api<{products:AnyRecord[];priceMarkup:string}>('/api/admin/products'),[]);const pools=useRemote(()=>api<{pools:AnyRecord[]}>('/api/admin/pools'),[]);const[error,setError]=useState('');async function submit(event:FormEvent<HTMLFormElement>){event.preventDefault();const f=new FormData(event.currentTarget);try{await api('/api/admin/products',{method:'POST',body:JSON.stringify({poolId:f.get('poolId'),name:f.get('name'),slug:f.get('slug'),description:f.get('description'),wholesaleCredits:f.get('credits'),currency:'USD',durationDays:Number(f.get('duration')),concurrencyLimit:Number(f.get('concurrency')),active:true})});event.currentTarget.reset();await products.reload();}catch(e){setError(e instanceof Error?e.message:String(e));}}return <><PageTitle eyebrow="Store / Products" title={t('products')}/><div className="notice-line"><CircleDollarSign/>PRICE_MARKUP = <b>{products.data?.priceMarkup??'—'}×</b></div>{error&&<div className="form-error">{error}</div>}<form className="panel inline-admin-form" onSubmit={submit}><h2>{t('addProduct')}</h2><label className="field"><span>{t('provider')}</span><select name="poolId" required>{pools.data?.pools.map(p=><option value={String(p.id)} key={String(p.id)}>{String(p.name)}</option>)}</select></label><Field label={t('providerName')} name="name" required/><Field label={t('slug')} name="slug" required pattern="[a-z0-9-]+"/><Field label={t('wholesaleCredits')} name="credits" type="number" step="0.0001" min="0.0001" required/><Field label={t('duration')} name="duration" type="number" min={1} defaultValue={30} required/><Field label="Concurrency" name="concurrency" type="number" min={1} defaultValue={2} required/><label className="field wide-field"><span>{t('description')}</span><input name="description"/></label><button className="button"><Plus/>{t('add')}</button></form><section className="panel"><DataTable headers={[t('provider'),t('providerName'),t('wholesaleCredits'),t('duration'),t('status')]} rows={(products.data?.products??[]).map(p=>[String(p.providerName),String(p.name),`$${String(p.wholesaleCredits)}`,`${String(p.durationDays)} ${t('days')}`,<StatusPill status={Boolean(p.active)?'ACTIVE':'DISABLED'}/>])}/></section></>}
+function AdminProducts() {
+  const { t, locale } = usePreferences();
+  const products = useRemote(() => api<{ products: AnyRecord[]; priceMarkup: string; billingUsdtPerUsd: string }>('/api/admin/products'), []);
+  const pools = useRemote(() => api<{ pools: AnyRecord[] }>('/api/admin/pools'), []);
+  const [error, setError] = useState('');
 
-function AdminUsers(){const{t,locale}=usePreferences();const remote=useRemote(()=>api<{users:(User&AnyRecord)[]}>('/api/admin/users'),[]);async function update(id:string,body:AnyRecord){await api(`/api/admin/users/${id}`,{method:'PATCH',body:JSON.stringify(body)});await remote.reload();}return <><PageTitle eyebrow="Access / Users" title={t('users')}/>{remote.loading?<Loading/>:<section className="panel"><DataTable headers={[t('email'),t('name'),t('role'),t('userStatus'),t('keys'),t('created'),'']} rows={(remote.data?.users??[]).map(u=>[u.email,u.name??'—',<StatusPill status={u.role}/>,<StatusPill status={String(u.status)}/>,String(u.keyCount),formatDate(String(u.createdAt),locale),<div className="row-actions"><button className="text-button" onClick={()=>update(u.id,{status:u.status==='ACTIVE'?'SUSPENDED':'ACTIVE'})}>{u.status==='ACTIVE'?'Suspend':'Activate'}</button><button className="text-button" onClick={()=>update(u.id,{role:u.role==='ADMIN'?'USER':'ADMIN'})}>{u.role==='ADMIN'?'Make user':'Make admin'}</button></div>])}/></section>}</>}
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const element = event.currentTarget;
+    const form = new FormData(element);
+    const duration = form.get('duration');
+    setError('');
+    try {
+      await api('/api/admin/products', { method: 'POST', body: JSON.stringify({
+        poolId: form.get('poolId'), name: form.get('name'), slug: form.get('slug'), description: form.get('description'),
+        wholesaleCredits: form.get('credits'), currency: 'USDT', durationDays: duration ? Number(duration) : null,
+        concurrencyLimit: Number(form.get('concurrency')), active: true,
+      }) });
+      element.reset();
+      await products.reload();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
 
-function AdminOrders(){const{t,locale}=usePreferences();const remote=useRemote(()=>api<{orders:AnyRecord[]}>('/api/admin/orders'),[]);return <><PageTitle eyebrow="Billing / Orders" title={t('orders')}/>{remote.loading?<Loading/>:<section className="panel"><DataTable headers={[t('email'),t('order'),t('provider'),t('paymentMethod'),t('amount'),t('status'),t('created')]} rows={(remote.data?.orders??[]).map(o=>[String(o.userEmail),String(o.productName),String(o.providerName),String(o.paymentProvider),`${String(o.amount)} ${String(o.currency)}`,<StatusPill status={String(o.status)}/>,formatDate(String(o.createdAt),locale)])}/></section>}</>}
+  return <>
+    <PageTitle title={t('products')}/>
+    <div className="notice-line"><CircleDollarSign/>PRICE_MARKUP = <b>{products.data?.priceMarkup ?? '—'}×</b></div>
+    {error && <div className="form-error">{error}</div>}
+    <form className="panel inline-admin-form" onSubmit={submit}>
+      <h2>{t('addProduct')}</h2>
+      <label className="field"><span>{t('provider')}</span><select name="poolId" required>
+        {pools.data?.pools.map(pool => <option value={String(pool.id)} key={String(pool.id)}>{String(pool.name)}</option>)}
+      </select></label>
+      <Field label={t('providerName')} name="name" required/>
+      <Field label={t('slug')} name="slug" required pattern="[a-z0-9-]+"/>
+      <Field label={t('wholesaleCredits')} name="credits" type="number" step="0.0001" min="0.0001" required/>
+      <Field label={t('duration')} name="duration" type="number" min={1} placeholder={t('noExpiry')}/>
+      <Field label={t('concurrentModelRequests')} name="concurrency" type="number" min={1} defaultValue={2} required/>
+      <label className="field wide-field"><span>{t('description')}</span><input name="description"/></label>
+      <button className="button"><Plus/>{t('add')}</button>
+    </form>
+    <section className="panel">
+      <DataTable headers={[t('provider'), t('providerName'), t('wholesaleCredits'), locale === 'ru' ? 'Цена, USDT' : 'Price, USDT', t('duration'), t('status')]} rows={(products.data?.products ?? []).map(product => [
+        String(product.providerName), String(product.name), money(String(product.wholesaleCredits), locale, 'USD'),
+        money(Number(product.wholesaleCredits) * Number(products.data?.priceMarkup) * Number(products.data?.billingUsdtPerUsd), locale),
+        product.durationDays == null ? t('noExpiry') : `${String(product.durationDays)} ${t('days')}`,
+        <StatusPill status={product.active ? 'ACTIVE' : 'DISABLED'}/>,
+      ])}/>
+    </section>
+  </>;
+}
+
+function AdminUsers() {
+  const { t, locale } = usePreferences();
+  const { user, refresh } = useAuth();
+  const remote = useRemote(() => api<{ users: (User & AnyRecord)[] }>('/api/admin/users'));
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState<string | null>(null);
+  async function update(id: string, body: AnyRecord) {
+    if (busy) return;
+    setBusy(id); setError('');
+    try {
+      await api(`/api/admin/users/${id}`, { method: 'PATCH', body: JSON.stringify(body) });
+      await remote.reload();
+      if (id === user?.id) await refresh();
+    } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+    finally { setBusy(null); }
+  }
+  return <><PageTitle eyebrow="Access / Users" title={t('users')}/>
+    {error && <p className="form-error" role="alert">{error}</p>}
+    {remote.loading ? <Loading/> : remote.error ? <ErrorState message={remote.error} retry={remote.reload}/> : <section className="panel">
+      <DataTable headers={[t('email'), t('name'), t('role'), t('userStatus'), t('keys'), t('created'), '']}
+        rows={(remote.data?.users ?? []).map(u => [
+          <Link to={`/admin/users/${u.id}/keys`}>{u.email}</Link>, u.name ?? '—', <StatusPill status={u.role}/>,
+          <StatusPill status={String(u.status)}/>, String(u.keyCount), formatDate(String(u.createdAt), locale),
+          <div className="row-actions">
+            <button className="text-button" disabled={!!busy} onClick={() => void update(u.id, { status: u.status === 'ACTIVE' ? 'SUSPENDED' : 'ACTIVE' })}>
+              {u.status === 'ACTIVE' ? (locale === 'ru' ? 'Заблокировать' : 'Suspend') : (locale === 'ru' ? 'Разблокировать' : 'Activate')}
+            </button>
+            <button className="text-button" disabled={!!busy} onClick={() => void update(u.id, { role: u.role === 'ADMIN' ? 'USER' : 'ADMIN' })}>
+              {u.role === 'ADMIN' ? (locale === 'ru' ? 'Сделать пользователем' : 'Make user') : (locale === 'ru' ? 'Сделать администратором' : 'Make admin')}
+            </button>
+          </div>,
+        ])}/>
+    </section>}
+  </>;
+}
+
+function AdminOrders() {
+  const { t, locale } = usePreferences();
+  const remote = useRemote(() => api<{ orders: AnyRecord[] }>('/api/admin/orders'), []);
+  return <>
+    <PageTitle title={t('orders')}/>
+    {remote.loading ? <Loading/> : remote.error ? <ErrorState message={remote.error} retry={remote.reload}/> : <section className="panel">
+      <DataTable headers={[t('email'), t('order'), t('provider'), t('paymentMethod'), t('amount'), t('status'), t('created')]}
+        rows={(remote.data?.orders ?? []).map(order => [
+          String(order.userEmail), order.topUpKeyId ? `${t('topUp')} · ${String(order.productName)}` : String(order.productName),
+          String(order.providerName), String(order.paymentProvider), money(String(order.amount), locale, String(order.currency)),
+          <StatusPill status={String(order.status)} topUp={!!order.topUpKeyId}/>, formatDate(String(order.createdAt), locale),
+        ])}/>
+    </section>}
+  </>;
+}
 
 function Monitoring(){const{t}=usePreferences();return <><PageTitle eyebrow="Observability / Grafana" title={t('monitoring')} action={<a className="button" href="/grafana/" target="_blank" rel="noreferrer"><BarChart3/>{t('openGrafana')}</a>}/><div className="monitor-grid"><article className="panel"><Activity/><h2>Service health</h2><p>Readiness checks PostgreSQL and reports upstream state without leaking credentials.</p><a href="/health/ready" target="_blank" rel="noreferrer">/health/ready <ArrowRight/></a></article><article className="panel"><Gauge/><h2>Prometheus</h2><p>Latency, throughput, 5xx rate, event-loop lag, memory, active streams, pool capacity, and cost.</p><code>prometheus:9090</code></article><article className="panel"><BarChart3/><h2>Grafana dashboard</h2><p>Pre-provisioned panels and alerts for saturation, provider degradation, and database health.</p><a href="/grafana/" target="_blank" rel="noreferrer">{t('openGrafana')} <ArrowRight/></a></article></div></>}
 
@@ -802,7 +1089,7 @@ export function App() {
         <Route path="/dashboard/profile" element={<ProfilePage/>}/>
       </Route>
     </Route>
-    <Route element={<ProtectedRoute admin/>}><Route element={<AppShell admin/>}><Route path="/admin" element={<AdminOverview/>}/><Route path="/admin/providers" element={<AdminProviders/>}/><Route path="/admin/products" element={<AdminProducts/>}/><Route path="/admin/users" element={<AdminUsers/>}/><Route path="/admin/orders" element={<AdminOrders/>}/><Route path="/admin/monitoring" element={<Monitoring/>}/></Route></Route>
+    <Route element={<ProtectedRoute admin/>}><Route element={<AppShell admin/>}><Route path="/admin" element={<AdminOverview/>}/><Route path="/admin/providers" element={<AdminProviders/>}/><Route path="/admin/products" element={<AdminProducts/>}/><Route path="/admin/users" element={<AdminUsers/>}/><Route path="/admin/users/:id/keys" element={<AdminUserKeys/>}/><Route path="/admin/orders" element={<AdminOrders/>}/><Route path="/admin/monitoring" element={<Monitoring/>}/></Route></Route>
     <Route path="*" element={<Navigate to="/" replace/>}/>
   </Routes></>;
 }

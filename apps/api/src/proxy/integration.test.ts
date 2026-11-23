@@ -6,7 +6,7 @@ import { buildApp } from '../app.js';
 import { sessionCookieName } from '../auth/session.js';
 import { config } from '../config.js';
 import { sql } from '../db/index.js';
-import { decryptSecret, encryptSecret, sha256 } from '../lib/crypto.js';
+import { decryptSecret, encryptSecret, hashPassword, sha256 } from '../lib/crypto.js';
 import { createOrder } from '../services/orders.js';
 import { refreshUpstreamCatalog } from '../services/upstream-catalog.js';
 
@@ -63,6 +63,12 @@ integration('purchase allocation and OpenAI-compatible proxy', () => {
       reply.hijack();
       reply.raw.writeHead(200, { 'content-type': 'text/event-stream' });
       reply.raw.write('event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":800,"cache_read_input_tokens":200,"cache_creation_input_tokens":300,"cache_creation":{"ephemeral_5m_input_tokens":200,"ephemeral_1h_input_tokens":100},"output_tokens":1}}}\n\n');
+      const interruption = (body.metadata as { user_id?: string } | undefined)?.user_id;
+      if (interruption === 'partial-usage-eof' || interruption === 'partial-usage-cancel') {
+        reply.raw.write('event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"unfinished output"}}\n\n');
+        if (interruption === 'partial-usage-eof') reply.raw.end();
+        return;
+      }
       reply.raw.write('event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":50},"delta":{"stop_reason":"end_turn"}}\n\n');
       reply.raw.end('event: message_stop\ndata: {"type":"message_stop"}\n\n');
     });
@@ -122,6 +128,7 @@ integration('purchase allocation and OpenAI-compatible proxy', () => {
     upstream.post('/v1/images/generations', async () => ({ data: [{ b64_json: 'aW1hZ2U=' }] }));
     upstream.post('/v1/chat/completions', async (request, reply) => {
       seenAuthorization.push(request.headers.authorization ?? '');
+      seenInference.push({ endpoint: request.url, body: request.body as Record<string, unknown>, headers: request.headers });
       reply.hijack();
       reply.raw.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
       reply.raw.write('data: {"choices":[{"delta":{"content":"ok"}}]}\n\n');
@@ -146,7 +153,7 @@ integration('purchase allocation and OpenAI-compatible proxy', () => {
     credentialId = credential!.id;
     const [product] = await sql<{ id: string }[]>`
       INSERT INTO products (pool_id, name, slug, wholesale_credits, currency, duration_days, concurrency_limit)
-      VALUES (${poolId}, 'Integration key', ${`${slug}-product`}, 10, 'USD', 30, 2)
+      VALUES (${poolId}, 'Integration key', ${`${slug}-product`}, 10, 'USDT', NULL, 2)
       RETURNING id
     `;
     productId = product!.id;
@@ -201,6 +208,7 @@ integration('purchase allocation and OpenAI-compatible proxy', () => {
       await sql`DELETE FROM request_leases WHERE upstream_credential_id IN ${sql(used)}`;
     }
     if (productId) {
+      await sql`DELETE FROM orders WHERE product_id = ${productId} AND top_up_key_id IS NOT NULL`;
       await sql`DELETE FROM api_keys WHERE product_id = ${productId}`;
       await sql`DELETE FROM orders WHERE product_id = ${productId}`;
       await sql`DELETE FROM products WHERE id = ${productId}`;
@@ -230,6 +238,56 @@ integration('purchase allocation and OpenAI-compatible proxy', () => {
     expect(product.inventory).toBe(0);
   });
 
+  it('blocks legacy mock keys and their top-ups after switching to production', async () => {
+    const beforeCalls = seenInference.length;
+    const beforeMode = config.NODE_ENV;
+    const [owned] = await sql<{ id: string }[]>`SELECT id FROM api_keys WHERE user_id = ${userIds[0]!}`;
+    Object.assign(config, { NODE_ENV: 'production' });
+    try {
+      const response = await app.inject({ method: 'POST', url: '/v1/responses', headers: auth(),
+        payload: { model: 'integration-model', input: 'test' } });
+      expect(response.statusCode).toBe(403);
+      expect(response.json().error.code).toBe('TEST_KEY_DISABLED');
+      expect(seenInference).toHaveLength(beforeCalls);
+      await expect(createOrder({ userId: userIds[0]!, userEmail: 'test@example.test', productId,
+        paymentProvider: 'mock', topUpKeyId: owned!.id })).rejects.toMatchObject({ code: 'KEY_TOP_UP_UNAVAILABLE' });
+    } finally { Object.assign(config, { NODE_ENV: beforeMode }); }
+  });
+
+  it('reveals the owner key from configured local and LAN origins while preserving password and origin checks', async () => {
+    const password = 'origin-only-test-password';
+    const [owner] = await sql<{ id: string; passwordHash: string }[]>`
+      SELECT id, password_hash FROM users WHERE id = ${userIds[0]!}`;
+    const [stored] = await sql<{ id: string }[]>`SELECT id FROM api_keys WHERE user_id = ${owner!.id}`;
+    const headers = await session(owner!.id);
+    await sql`UPDATE users SET password_hash = ${await hashPassword(password)} WHERE id = ${owner!.id}`;
+    const url = `/api/keys/${stored!.id}/reveal`;
+    try {
+      for (const origin of ['http://localhost:8080', 'http://127.0.0.1:8080', 'http://172.20.10.4:8080']) {
+        const response = await app.inject({ method: 'POST', url, headers: { ...headers, origin }, payload: { password } });
+        expect(response.statusCode).toBe(200);
+        expect(response.json()).toEqual({ apiKey: key });
+        expect(response.headers['cache-control']).toBe('no-store');
+        expect(response.headers['access-control-allow-origin']).toBe(origin);
+      }
+      const wrongPassword = await app.inject({ method: 'POST', url,
+        headers: { ...headers, origin: 'http://172.20.10.4:8080' }, payload: { password: 'incorrect' } });
+      expect(wrongPassword.statusCode).toBe(401);
+      expect(wrongPassword.json().error.code).toBe('INVALID_PASSWORD');
+      expect(wrongPassword.payload).not.toContain(key);
+
+      for (const origin of ['https://attacker.example', 'http://172.20.10.4:8081', 'null']) {
+        const response = await app.inject({ method: 'POST', url, headers: { ...headers, origin }, payload: { password } });
+        expect(response.statusCode).toBe(403);
+        expect(response.json().error.code).toBe('INVALID_ORIGIN');
+        expect(response.payload).not.toContain(key);
+        expect(response.headers['access-control-allow-origin']).toBeUndefined();
+      }
+    } finally {
+      await sql`UPDATE users SET password_hash = ${owner!.passwordHash} WHERE id = ${owner!.id}`;
+    }
+  });
+
   it('forwards Responses and streaming Chat Completions while recording exact usage', async () => {
     const response = await app.inject({
       method: 'POST',
@@ -249,6 +307,7 @@ integration('purchase allocation and OpenAI-compatible proxy', () => {
     expect(stream.statusCode).toBe(200);
     expect(stream.payload).toContain('data: [DONE]');
     expect(seenAuthorization).toEqual(['Bearer upstream-test-key', 'Bearer upstream-test-key']);
+    expect(seenInference.slice(0, 2).map(request => request.body.service_tier)).toEqual(['default', 'default']);
 
     let accounting: { creditsUsed: string; requestCount: number } | undefined;
     for (let attempt = 0; attempt < 40; attempt += 1) {
@@ -263,6 +322,12 @@ integration('purchase allocation and OpenAI-compatible proxy', () => {
     }
     expect(accounting?.creditsUsed).toBe('0.00435000');
     expect(accounting?.requestCount).toBe(2);
+    const [entry] = await sql`SELECT input_tokens::text, cached_input_tokens::text, output_tokens::text,
+      cost::text, retail_cost::text FROM usage_records
+      WHERE api_key_id = (SELECT id FROM api_keys WHERE user_id = ${userIds[0]!}) AND endpoint = '/v1/responses'`;
+    // Tokens remain 1:1; only monetary rates carry the x2 markup.
+    expect(entry).toMatchObject({ inputTokens: '1000', cachedInputTokens: '200', outputTokens: '500',
+      cost: '0.00182000', retailCost: '0.00364000' });
   });
 
   it('hides unpriced or unavailable models, and blocks stored state and path escapes before upstream', async () => {
@@ -300,10 +365,31 @@ integration('purchase allocation and OpenAI-compatible proxy', () => {
     ]));
     const url = `/api/products/${productId}/estimate?model=integration-model&inputTokens=1000&outputTokens=500`;
     const estimate = await app.inject({ method: 'GET', url: `${url}&cachedInputTokens=200` });
-    expect(estimate.json()).toEqual({ cost: '0.00364000', requestsPerKey: '5494', longContextApplied: false, peakApplied: false });
+    expect(estimate.json()).toEqual({ currency: 'USDT', cost: '0.00364000', requestsPerKey: '5494', longContextApplied: false, peakApplied: false });
     expect((await app.inject({ method: 'GET', url: `${url}&cachedInputTokens=1001` })).statusCode).toBe(400);
     const long = await app.inject({ method: 'GET', url: `/api/products/${productId}/estimate?model=other-model&inputTokens=300000&cachedInputTokens=100000&outputTokens=2000` });
-    expect(long.json()).toEqual({ cost: '1.71200000', requestsPerKey: '11', longContextApplied: true, peakApplied: false });
+    expect(long.json()).toEqual({ currency: 'USDT', cost: '1.71200000', requestsPerKey: '11', longContextApplied: true, peakApplied: false });
+  });
+
+  it('rejects unpriced tiers, audio and stored prompt templates without spending or contacting upstream', async () => {
+    const before = seenInference.length;
+    const usageBefore = await sql`SELECT count(*)::int AS count FROM usage_records WHERE upstream_credential_id = ${credentialId}`;
+    const cases = [
+      { endpoint: '/v1/responses', payload: { service_tier: 'priority' }, code: 'UNPRICED_REQUEST_OPTION' },
+      { endpoint: '/v1/chat/completions', payload: { service_tier: 'fast' }, code: 'UNPRICED_REQUEST_OPTION' },
+      { endpoint: '/v1/chat/completions', payload: { modalities: ['text', 'audio'], audio: { voice: 'alloy', format: 'wav' } }, code: 'UNPRICED_REQUEST_OPTION' },
+      { endpoint: '/v1/chat/completions', payload: { messages: [{ role: 'user', content: [{ type: 'input_audio', input_audio: { data: 'synthetic', format: 'wav' } }] }] }, code: 'UNPRICED_REQUEST_OPTION' },
+      { endpoint: '/v1/responses', payload: { prompt: { id: 'pmpt_other_customer' } }, code: 'STORED_RESOURCE_NOT_SUPPORTED' },
+      { endpoint: '/v1/responses/compact', payload: { prompt: { id: 'pmpt_other_customer' } }, code: 'STORED_RESOURCE_NOT_SUPPORTED' },
+    ];
+    for (const entry of cases) {
+      const response = await app.inject({ method: 'POST', url: entry.endpoint, headers: auth(),
+        payload: { model: 'integration-model', ...entry.payload } });
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.code).toBe(entry.code);
+    }
+    expect(seenInference.length).toBe(before);
+    expect(await sql`SELECT count(*)::int AS count FROM usage_records WHERE upstream_credential_id = ${credentialId}`).toEqual(usageBefore);
   });
 
   it('paginates charges for the owner and rejects another account', async () => {
@@ -311,7 +397,14 @@ integration('purchase allocation and OpenAI-compatible proxy', () => {
     const id = first!.id;
     const url = `/api/keys/${id}/usage?limit=1`;
     expect((await app.inject({ method: 'GET', url })).statusCode).toBe(401);
-    expect((await app.inject({ method: 'GET', url, headers: await session(userIds[1]!) })).statusCode).toBe(404);
+    const other = await session(userIds[1]!);
+    expect((await app.inject({ method: 'GET', url, headers: other })).statusCode).toBe(404);
+    expect((await app.inject({ method: 'POST', url: `/api/keys/${id}/reveal`, headers: other,
+      payload: { password: 'NotTheOwnerPassword123!' } })).statusCode).toBe(404);
+    expect((await app.inject({ method: 'POST', url: `/api/keys/${id}/revoke`, headers: other })).statusCode).toBe(404);
+    const [owned] = await sql<{ orderId: string }[]>`SELECT order_id FROM api_keys WHERE id = ${id}`;
+    expect((await app.inject({ method: 'GET', url: `/api/orders/${owned!.orderId}`, headers: other })).statusCode).toBe(404);
+    expect((await app.inject({ method: 'POST', url: `/api/payments/mock/${owned!.orderId}/complete`, headers: other })).statusCode).toBe(404);
     const owner = await session(userIds[0]!);
     const keys = await app.inject({ method: 'GET', url: '/api/keys', headers: owner });
     expect(keys.json().keys[0].models).toContain('integration-model');
@@ -537,5 +630,162 @@ integration('purchase allocation and OpenAI-compatible proxy', () => {
       return transaction`SELECT 1 FROM sellable_upstream_slots WHERE id IN ${transaction(channelCredentials)}`;
     });
     expect(saleReady).toHaveLength(0);
+  });
+
+  it('credits an active prepaid key once, even when both provider slots are taken', async () => {
+    const owner = await session(userIds[1]!);
+    const keyList = await app.inject({ method: 'GET', url: '/api/keys', headers: owner });
+    const [original] = keyList.json().keys;
+    expect(original).toMatchObject({ expiresAt: null, creditsTotal: '20.00000000', testKey: true, topUpProductIds: [productId] });
+
+    const payload = { productId, paymentProvider: 'mock', topUpKeyId: original.id };
+    const foreign = await app.inject({ method: 'POST', url: '/api/orders', headers: await session(userIds[0]!), payload });
+    expect(foreign.statusCode).toBe(404);
+    const checkout = await app.inject({ method: 'POST', url: '/api/orders', headers: owner, payload });
+    expect(checkout.statusCode).toBe(201);
+    const { order } = checkout.json();
+    expect(order.topUpKeyId).toBe(original.id);
+    expect(await sql`SELECT assigned, reserved FROM sellable_upstream_slots WHERE id = ${credentialId}`)
+      .toEqual([{ assigned: 2, reserved: 0 }]);
+
+    const balance = () => app.inject({ method: 'GET', url: '/api/keys', headers: owner }).then(response => response.json().keys);
+    expect(await balance()).toMatchObject([{ id: original.id, creditsTotal: '20.00000000' }]);
+    const confirm = () => app.inject({ method: 'POST', url: `/api/payments/mock/${order.id}/complete`, headers: owner });
+    for (const result of await Promise.all([confirm(), confirm()])) expect(result.statusCode).toBe(200);
+    expect(await balance()).toMatchObject([{
+      id: original.id, keyHint: original.keyHint, expiresAt: null, creditsTotal: '40.00000000', creditsUsed: original.creditsUsed,
+    }]);
+    expect(await balance()).toHaveLength(1);
+    const completed = await app.inject({ method: 'GET', url: `/api/orders/${order.id}`, headers: owner });
+    expect(completed.json().order).toMatchObject({ status: 'FULFILLED', topUpKeyId: original.id, apiKeyId: original.id });
+  });
+
+  it('reserves a slot for an exhausted key and restores its access using the same secret', async () => {
+    const owner = await session(userIds[1]!);
+    const [target] = await sql<{ id: string; creditsTotal: string }[]>`
+      UPDATE api_keys SET status = 'EXHAUSTED', credits_used = credits_total WHERE user_id = ${userIds[1]!}
+      RETURNING id, credits_total::text
+    `;
+    const headers = { authorization: `Bearer ${secondKey}` };
+    expect((await app.inject({ method: 'GET', url: '/v1/models', headers })).statusCode).toBe(402);
+    const checkout = await app.inject({ method: 'POST', url: '/api/orders', headers: owner,
+      payload: { productId, paymentProvider: 'mock', topUpKeyId: target!.id } });
+    expect(checkout.statusCode).toBe(201);
+    expect(await sql`SELECT assigned, reserved FROM sellable_upstream_slots WHERE id = ${credentialId}`)
+      .toEqual([{ assigned: 1, reserved: 1 }]);
+
+    const { order } = checkout.json();
+    expect((await app.inject({ method: 'POST', url: `/api/payments/mock/${order.id}/complete`, headers: owner })).statusCode).toBe(200);
+    expect(await sql`SELECT status, (credits_total - credits_used)::text AS remaining FROM api_keys WHERE id = ${target!.id}`)
+      .toEqual([{ status: 'ACTIVE', remaining: '20.00000000' }]);
+    expect(await sql`SELECT 1 FROM api_key_channel_assignments WHERE api_key_id = ${target!.id}`).toHaveLength(0);
+    expect(await sql`SELECT assigned, reserved FROM sellable_upstream_slots WHERE id = ${credentialId}`)
+      .toEqual([{ assigned: 2, reserved: 0 }]);
+    expect((await app.inject({ method: 'GET', url: '/v1/models', headers })).statusCode).toBe(200);
+  });
+
+  it('moves a prepaid key to funded capacity without changing its secret or charging for an unavailable request', async () => {
+    const [original] = await sql<{ spendLimit: string | null; spendUsed: string }[]>`
+      SELECT spend_limit::text, spend_used::text FROM upstream_credentials WHERE id = ${credentialId}`;
+    const [target] = await sql<{ id: string; creditsUsed: string }[]>`
+      SELECT id, credits_used::text FROM api_keys WHERE user_id = ${userIds[1]!}`;
+    const secret = `replacement-${randomUUID()}`;
+    const [replacement] = await sql<{ id: string }[]>`
+      INSERT INTO upstream_credentials (pool_id, label, encrypted_key, key_hint, spend_limit)
+      VALUES (${poolId}, 'Replacement', ${encryptSecret(secret)}, 'masked', 100) RETURNING id`;
+    const headers = { authorization: `Bearer ${secondKey}` };
+    const call = () => app.inject({ method: 'POST', url: '/v1/responses', headers,
+      payload: { model: 'integration-model', input: 'budget rollover', max_output_tokens: 1000 } });
+    try {
+      await refreshUpstreamCatalog(replacement!.id);
+      await sql`UPDATE upstream_credentials SET spend_limit = spend_used + 0.00000001 WHERE id = ${credentialId}`;
+      const response = await call();
+      expect(response.statusCode).toBe(200);
+      expect(seenAuthorization.at(-1)).toBe(`Bearer ${secret}`);
+      expect(await sql`SELECT upstream_credential_id, key_hash FROM api_keys WHERE id = ${target!.id}`)
+        .toEqual([{ upstreamCredentialId: replacement!.id, keyHash: sha256(secondKey) }]);
+      const [paid] = await sql<{ creditsUsed: string }[]>`SELECT credits_used::text FROM api_keys WHERE id = ${target!.id}`;
+      expect(Number(paid!.creditsUsed) - Number(target!.creditsUsed)).toBeCloseTo(0.00364, 8);
+
+      await sql`UPDATE upstream_credentials SET status = 'EXHAUSTED', spend_used = spend_limit WHERE id IN ${sql([credentialId, replacement!.id])}`;
+      const declined = await call();
+      expect(declined.statusCode).toBe(503);
+      expect(await sql`SELECT credits_used::text FROM api_keys WHERE id = ${target!.id}`).toEqual([paid]);
+      await sql`UPDATE upstream_credentials SET status = 'ACTIVE', spend_used = 0 WHERE id = ${replacement!.id}`;
+      expect((await call()).statusCode).toBe(200);
+    } finally {
+      await sql`UPDATE api_keys SET upstream_credential_id = ${credentialId} WHERE id = ${target!.id}`;
+      await sql`DELETE FROM usage_records WHERE upstream_credential_id = ${replacement!.id}`;
+      await sql`DELETE FROM upstream_credentials WHERE id = ${replacement!.id}`;
+      await sql`UPDATE upstream_credentials SET status = 'ACTIVE', spend_limit = ${original!.spendLimit}, spend_used = ${original!.spendUsed} WHERE id = ${credentialId}`;
+    }
+  });
+
+  it('fulfills a top-up using a replacement when the assigned provider key is exhausted', async () => {
+    const owner = await session(userIds[1]!);
+    const [target] = await sql<{ id: string; creditsTotal: string; creditsUsed: string }[]>`
+      SELECT id, credits_total::text, credits_used::text FROM api_keys WHERE user_id = ${userIds[1]!}`;
+    const [replacement] = await sql<{ id: string }[]>`
+      INSERT INTO upstream_credentials (pool_id, label, encrypted_key, key_hint, spend_limit)
+      VALUES (${poolId}, 'Top-up replacement', ${encryptSecret(`topup-${randomUUID()}`)}, 'masked', 100) RETURNING id`;
+    try {
+      await refreshUpstreamCatalog(replacement!.id);
+      await sql`UPDATE upstream_credentials SET status = 'EXHAUSTED' WHERE id = ${credentialId}`;
+      const checkout = await app.inject({ method: 'POST', url: '/api/orders', headers: owner,
+        payload: { productId, paymentProvider: 'mock', topUpKeyId: target!.id } });
+      expect(checkout.statusCode).toBe(201);
+      const { order } = checkout.json();
+      expect((await app.inject({ method: 'POST', url: `/api/payments/mock/${order.id}/complete`, headers: owner })).statusCode).toBe(200);
+      const [toppedUp] = await sql<{ creditsTotal: string; creditsUsed: string; upstreamCredentialId: string; keyHash: string }[]>`
+        SELECT credits_total::text, credits_used::text, upstream_credential_id, key_hash FROM api_keys WHERE id = ${target!.id}`;
+      expect(Number(toppedUp!.creditsTotal) - Number(target!.creditsTotal)).toBe(20);
+      expect(toppedUp).toMatchObject({ creditsUsed: target!.creditsUsed, upstreamCredentialId: replacement!.id, keyHash: sha256(secondKey) });
+      expect((await app.inject({ method: 'GET', url: '/v1/models', headers: { authorization: `Bearer ${secondKey}` } })).statusCode).toBe(200);
+    } finally {
+      await sql`UPDATE api_keys SET upstream_credential_id = ${credentialId} WHERE id = ${target!.id}`;
+      await sql`UPDATE orders SET upstream_credential_id = ${credentialId} WHERE upstream_credential_id = ${replacement!.id}`;
+      await sql`DELETE FROM upstream_credentials WHERE id = ${replacement!.id}`;
+      await sql`UPDATE upstream_credentials SET status = 'ACTIVE' WHERE id = ${credentialId}`;
+    }
+  });
+
+  it('holds reservations for interrupted Anthropic streams even after partial usage was received', async () => {
+    const address = app.server.address();
+    if (!address || typeof address === 'string') throw new Error('Test proxy is not listening');
+    const [target] = await sql<{ id: string }[]>`SELECT id FROM api_keys WHERE user_id = ${userIds[1]!}`;
+    const baseline = await sql<{ id: string }[]>`SELECT id FROM request_leases WHERE api_key_id = ${target!.id}`;
+    const baselineIds = baseline.map(lease => lease.id);
+    try {
+      for (const mode of ['eof', 'cancel'] as const) {
+        const controller = new AbortController();
+        const response = await fetch(`http://127.0.0.1:${address.port}/v1/messages`, { method: 'POST',
+          headers: { 'x-api-key': secondKey, 'content-type': 'application/json' }, signal: controller.signal,
+          body: JSON.stringify({ model: 'claude-integration', max_tokens: 64, stream: true, metadata: { user_id: `partial-usage-${mode}` },
+            messages: [{ role: 'user', content: 'test interruption' }] }) });
+        expect(response.status).toBe(200);
+        if (mode === 'eof') await expect(response.text()).rejects.toThrow();
+        else {
+          const reader = response.body!.getReader();
+          try { expect((await reader.read()).value?.length).toBeGreaterThan(0); }
+          finally { controller.abort(); await reader.cancel().catch(() => undefined); }
+        }
+        let entry: { status: string; errorCode: string; cost: string } | undefined;
+        for (let attempt = 0; attempt < 40; attempt++) {
+          [entry] = await sql<{ status: string; errorCode: string; cost: string }[]>`
+            SELECT status, error_code, cost::text FROM usage_records WHERE request_id = ${response.headers.get('x-proxy-request-id')}`;
+          if (entry?.status !== 'STARTED') break;
+          await delay(10);
+        }
+        expect(entry).toMatchObject({ status: mode === 'eof' ? 'FAILED' : 'CANCELLED', cost: '0.00127200' });
+        expect(entry?.errorCode).toContain('USAGE_UNCONFIRMED');
+        const [held] = await sql<{ count: number }[]>`SELECT count(*)::int AS count FROM request_leases
+          WHERE api_key_id = ${target!.id} AND id <> ALL(${sql.array(baselineIds)}::uuid[])
+            AND expires_at > now() AND reserved_cost > 0`;
+        expect(held?.count).toBe(1);
+        // Keep unrelated cooldowns intact; free only this case's verified lease
+        // before exercising the other interruption with the same two-slot key.
+        await sql`DELETE FROM request_leases WHERE api_key_id = ${target!.id} AND id <> ALL(${sql.array(baselineIds)}::uuid[])`;
+      }
+    } finally { await sql`DELETE FROM request_leases WHERE api_key_id = ${target!.id} AND id <> ALL(${sql.array(baselineIds)}::uuid[])`; }
   });
 });

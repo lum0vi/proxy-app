@@ -6,6 +6,8 @@ import { sql } from '../db/index.js';
 import { decryptSecret, encryptSecret, keyHint, sha256, upstreamKeyFingerprint } from '../lib/crypto.js';
 import { CeManagement, CeManagementError, ceOrigin } from './ce-management.js';
 import { refreshUpstreamCatalog } from './upstream-catalog.js';
+import { ceBalanceProvider, recordProviderBalance, recordProviderBalanceFailure } from './provider-balances.js';
+import { beginProviderKeySync, recordProviderKeyFailure, recordProviderKeys } from './provider-keys.js';
 
 type Connection = postgres.ReservedSql;
 
@@ -114,7 +116,14 @@ async function eligiblePools(db: Connection, slugs: string[]) {
   return db<Pool[]>`
     SELECT pool.id, pool.slug, pool.base_url,
       COALESCE((SELECT sum(GREATEST(0, slot.credential_capacity - slot.assigned - slot.reserved))
-        FROM sellable_upstream_slots slot WHERE slot.pool_id = pool.id AND NOT slot.test_only), 0)::int AS free_slots,
+        FROM sellable_upstream_slots slot JOIN upstream_credentials uc ON uc.id = slot.id
+        WHERE slot.pool_id = pool.id AND NOT slot.test_only
+          AND (uc.spend_limit IS NULL OR uc.spend_limit - uc.spend_used - COALESCE((
+            SELECT sum(lease.reserved_cost) FROM request_leases lease
+            WHERE lease.upstream_credential_id = uc.id AND lease.expires_at > now()
+          ), 0) >= (SELECT max(product.wholesale_credits) FROM pool_channels channels
+            JOIN products product ON product.pool_id = channels.root_pool_id WHERE channels.pool_id = pool.id AND product.active))
+      ), 0)::int AS free_slots,
       (SELECT (max(product.wholesale_credits) * pool.credential_capacity)::text
         FROM pool_channels channels JOIN products product ON product.pool_id = channels.root_pool_id
       WHERE channels.pool_id = pool.id AND product.active) AS quota
@@ -197,14 +206,45 @@ async function withCeLock<T>(run: (db: Connection) => Promise<T>): Promise<T | u
   }
 }
 
-async function openCeSession(db: Connection, ce: CeManagement, login: CeLogin) {
+async function openCeAccount(db: Connection, ce: CeManagement, login: CeLogin) {
   let access = await accessToken(db, ce, login);
   const account = await ce.account(access).catch(async error => {
     if (!(error instanceof CeManagementError) || error.status !== 401) throw error;
     access = await accessToken(db, ce, login, true);
     return ce.account(access);
   });
+  return { access, account };
+}
+
+async function openCeSession(db: Connection, ce: CeManagement, login: CeLogin) {
+  const { access, account } = await openCeAccount(db, ce, login);
   return { access, account, groups: await ce.groups(access) };
+}
+
+export async function checkCeBalance(login: CeLogin, request: typeof fetch = fetch): Promise<void> {
+  await withCeLock(async db => {
+    try {
+      const { account } = await openCeAccount(db, new CeManagement(request), login);
+      await recordProviderBalance(ceBalanceProvider, account.balance);
+    } catch (error) {
+      await recordProviderBalanceFailure(ceBalanceProvider, ceProvisioningErrorCode(error));
+    }
+  });
+}
+
+export async function syncCeKeys(login: CeLogin, request: typeof fetch = fetch): Promise<void> {
+  await withCeLock(async db => {
+    const startedAt = await beginProviderKeySync();
+    try {
+      const ce = new CeManagement(request);
+      const { access, account } = await openCeAccount(db, ce, login);
+      const keys = await ce.keys(access);
+      await recordProviderKeys(account.id, keys, startedAt);
+      await recordProviderBalance(ceBalanceProvider, account.balance);
+    } catch (error) {
+      await recordProviderKeyFailure(ceProvisioningErrorCode(error), startedAt);
+    }
+  });
 }
 
 export async function listCeGroups(login: CeLogin) {

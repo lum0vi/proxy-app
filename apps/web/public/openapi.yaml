@@ -3,7 +3,7 @@ info:
   title: ProxyKey API
   version: 0.1.0
   description: |
-    Store API and inference gateway for prepaid API keys. The full purchase price is the key's USD balance.
+    Store API and inference gateway for prepaid API keys. The selected package amount becomes the key's USDT balance. Pay in RUB through YooKassa or in USDT on TON through NOWPayments.
     OpenAI-compatible, Anthropic Messages, and Gemini requests draw from this shared balance.
     The gateway does not store prompt or response bodies and accepts stateless requests.
 servers:
@@ -87,9 +87,13 @@ paths:
                 type: object
                 properties:
                   appName: { type: string }
+                  paymentCurrencies:
+                    type: array
+                    items: { enum: [USDT, RUB] }
+                    description: Enabled checkout currencies. The initial production release enables USDT only.
                   paymentMethods:
                     type: array
-                    items: { enum: [stripe, nowpayments, mock] }
+                    items: { enum: [yookassa, nowpayments, mock] }
   /api/auth/register:
     post:
       tags: [Authentication]
@@ -179,21 +183,26 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [products, paymentMethods]
+                required: [products, paymentMethods, paymentCurrencies]
                 properties:
                   products:
                     type: array
                     items: { $ref: '#/components/schemas/Product' }
+                  paymentCurrencies:
+                    type: array
+                    items: { enum: [USDT, RUB] }
                   paymentMethods:
                     type: array
-                    items: { enum: [stripe, nowpayments, mock] }
+                    items: { enum: [yookassa, nowpayments, mock] }
                   cryptoCurrency:
                     type: [string, 'null']
-                    description: Cryptocurrency selected for checkout when that method is enabled.
+                    description: USDT when crypto checkout is enabled.
+                  cryptoNetwork: { type: [string, 'null'], enum: [TON, null] }
+                  currency: { const: USDT }
   /api/price-rates:
     get:
       tags: [Store]
-      summary: Get indicative RUB and TON prices per USD
+      summary: Get the USDT to RUB exchange rate
       operationId: getPriceRates
       responses:
         '200':
@@ -206,17 +215,17 @@ paths:
                 properties:
                   rates:
                     type: [object, 'null']
-                    required: [usdToRub, usdToTon, checkedAt]
+                    required: [usdtToRub, checkedAt, source]
                     properties:
-                      usdToRub: { type: string, example: '82.40000000' }
-                      usdToTon: { type: string, example: '0.91000000' }
+                      usdtToRub: { type: string, example: '82.40000000' }
+                      source: { enum: [coingecko, configured] }
                       checkedAt: { type: string, format: date-time }
   /api/products/{id}/estimate:
     parameters:
       - $ref: '#/components/parameters/UuidId'
     get:
       tags: [Store]
-      summary: Estimate the USD charge for a text or image request at the current retail rate
+      summary: Estimate the USDT charge for a text or image request at the current retail rate
       operationId: estimateProductUsage
       parameters:
         - { name: model, in: query, required: true, schema: { type: string, maxLength: 200 } }
@@ -238,7 +247,8 @@ paths:
                 type: object
                 required: [cost, requestsPerKey, longContextApplied, peakApplied]
                 properties:
-                  cost: { type: string, description: Estimated USD charge per request, example: '0.00364000' }
+                  currency: { const: USDT }
+                  cost: { type: string, description: Estimated USDT charge per request, example: '0.00364000' }
                   requestsPerKey: { type: [string, 'null'], description: The package price divided by cost and rounded down. Null if cost is zero., example: '5494' }
                   longContextApplied: { type: boolean }
                   peakApplied: { type: boolean }
@@ -264,7 +274,11 @@ paths:
         '401': { $ref: '#/components/responses/Error' }
     post:
       tags: [Store]
-      summary: Reserve upstream capacity and create a one-time checkout
+      summary: Create a one-time checkout for a new key or an existing key top-up
+      description: >-
+        Omit topUpKeyId to buy a new API key. Include the ID of an owned, eligible key
+        to add the selected USDT amount to its balance after payment confirmation. YooKassa charges RUB at a locked exchange rate; NOWPayments charges USDT on TON. Key IDs
+        are available from GET /api/keys. The key secret and existing usage stay attached to the same key.
       operationId: createOrder
       security: [{ sessionCookie: [] }]
       requestBody:
@@ -276,7 +290,12 @@ paths:
               required: [productId, paymentProvider]
               properties:
                 productId: { type: string, format: uuid }
-                paymentProvider: { enum: [stripe, nowpayments, mock] }
+                paymentProvider: { enum: [yookassa, nowpayments, mock] }
+                paymentCurrency:
+                  type: string
+                  enum: [RUB, USDT]
+                  description: Payment currency. YooKassa supports RUB, NOWPayments supports USDT, and local mock payments support both. If omitted, defaults to RUB for YooKassa and USDT otherwise. The server locks the RUB exchange rate when creating the invoice; the key balance is always credited in USDT.
+                topUpKeyId: { type: string, format: uuid }
       responses:
         '201':
           description: Checkout created
@@ -421,6 +440,49 @@ paths:
           content:
             application/json:
               schema: { type: object, additionalProperties: true }
+        '403': { $ref: '#/components/responses/Error' }
+  /api/admin/provider-balances:
+    get:
+      tags: [Admin]
+      summary: Provider account balances and low-balance notification status
+      description: Administrator only. Balance is the last successful provider API reading, never a sum of local key limits. Stale or failed checks retain the last reading and expose its timestamp and error.
+      operationId: getProviderBalances
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200':
+          description: Monitoring settings and account balances
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [monitoring, balances]
+                properties:
+                  monitoring:
+                    type: object
+                    properties:
+                      ceEnabled: { type: boolean }
+                      intervalMs: { type: integer }
+                      smtpConfigured: { type: boolean }
+                      lowThresholdUsd: { type: string }
+                  balances:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        provider: { type: string }
+                        balanceUsd: { type: [string, 'null'] }
+                        lowThresholdUsd: { type: string }
+                        checkedAt: { type: [string, 'null'], format: date-time }
+                        lastAttemptAt: { type: string, format: date-time }
+                        lastError: { type: [string, 'null'] }
+                        lowSince: { type: [string, 'null'], format: date-time }
+                        enabled: { type: boolean }
+                        lowBalance: { type: boolean }
+                        stale: { type: boolean }
+                        notificationStatus: { type: [string, 'null'], enum: [PENDING, SENT, CANCELLED, null] }
+                        notificationError: { type: [string, 'null'] }
+                        lastNotifiedAt: { type: [string, 'null'], format: date-time }
+        '401': { $ref: '#/components/responses/Error' }
         '403': { $ref: '#/components/responses/Error' }
   /api/admin/pools:
     get:
@@ -741,6 +803,136 @@ paths:
       responses:
         '200': { $ref: '#/components/responses/OpenAIProxyResponse' }
         default: { description: Gemini error envelope with error.code and error.status }
+  /api/admin/provider-keys:
+    get:
+      tags: [Admin]
+      operationId: listProviderKeys
+      summary: List the CE key inventory, remaining quotas and linked customer balances
+      description: Admin-only snapshot. Full API keys and fingerprints are never returned. Inspect sync.stale before treating a balance as current.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { in: query, name: activeOnly, schema: { type: boolean, default: true } }
+        - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
+        - { in: query, name: pageSize, schema: { type: integer, minimum: 1, maximum: 100, default: 25 } }
+      responses:
+        '200':
+          description: Inventory snapshot and synchronization status.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total: { type: integer }
+                  page: { type: integer }
+                  pageSize: { type: integer }
+                  keys:
+                    type: array
+                    items: { $ref: '#/components/schemas/ProviderInventoryKey' }
+                  sync:
+                    type: object
+                    properties:
+                      enabled: { type: boolean }
+                      stale: { type: boolean }
+                      requested: { type: boolean }
+                      intervalMs: { type: integer }
+                      accountId: { type: [string, 'null'] }
+                      checkedAt: { type: [string, 'null'], format: date-time }
+                      attemptedAt: { type: [string, 'null'], format: date-time }
+                      lastError: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+  /api/admin/provider-keys/refresh:
+    post:
+      tags: [Admin]
+      operationId: requestProviderKeyRefresh
+      summary: Queue a CE inventory refresh for the worker
+      security: [{ sessionCookie: [] }]
+      responses:
+        '202':
+          description: Refresh queued; poll the inventory endpoint for completion.
+          content:
+            application/json:
+              schema: { type: object, properties: { queued: { const: true } } }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { description: CE_KEY_SYNC_ENABLED is disabled. }
+  /api/admin/users/{id}/keys:
+    parameters:
+      - $ref: '#/components/parameters/UuidId'
+    get:
+      tags: [Admin]
+      operationId: listAdminUserKeys
+      summary: List a customer's keys, USDT balances and provider assignments
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { in: query, name: activeOnly, schema: { type: boolean, default: true } }
+        - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
+        - { in: query, name: pageSize, schema: { type: integer, minimum: 1, maximum: 100, default: 25 } }
+      responses:
+        '200':
+          description: Customer balances and distinct primary or model-channel assignments; provider balances may be shared.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { type: object, properties: { id: { type: string, format: uuid }, email: { type: string }, name: { type: [string, 'null'] } } }
+                  total: { type: integer }
+                  page: { type: integer }
+                  pageSize: { type: integer }
+                  keys:
+                    type: array
+                    items: { $ref: '#/components/schemas/AdminCustomerKey' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+  /api/webhooks/yookassa:
+    post:
+      tags: [Store]
+      operationId: confirmYooKassaPayment
+      summary: Reconcile a YooKassa payment notification against the authenticated provider API
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, event, object]
+              properties:
+                type: { const: notification }
+                event: { type: string, example: payment.succeeded }
+                object:
+                  type: object
+                  required: [id]
+                  properties:
+                    id: { type: string, format: uuid }
+      responses:
+        '200': { description: Payment verified or notification ignored; repeats are idempotent. }
+        '400': { description: Invalid notification or payment does not match the saved order. }
+        '502': { description: Provider unavailable or returned invalid payment data; retry delivery. }
+        '503': { description: Payment API unavailable or checkout not saved yet; retry delivery. }
+  /api/webhooks/nowpayments:
+    post:
+      tags: [Store]
+      operationId: confirmNowPaymentsPayment
+      summary: Verify the signed IPN and reconcile a full USDT-on-TON payment
+      security: []
+      parameters:
+        - in: header
+          name: x-nowpayments-sig
+          required: true
+          schema: { type: string, pattern: '^[a-fA-F0-9]{128}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200': { description: Signed notification accepted; repeats are idempotent. }
+        '400': { description: Invalid signature, coin, amount or payment ID. }
+        '503': { description: Checkout not saved yet; retry delivery. }
+
 components:
   securitySchemes:
     sessionCookie:
@@ -818,6 +1010,73 @@ components:
         text/event-stream:
           schema: { type: string }
   schemas:
+    ProviderInventoryKey:
+      type: object
+      properties:
+        externalId: { type: string }
+        accountId: { type: string }
+        name: { type: string }
+        keyHint: { type: string, description: Masked key hint only. }
+        groupId: { type: [string, 'null'] }
+        groupName: { type: [string, 'null'] }
+        status: { type: string }
+        active: { type: boolean, description: Present, enabled, not expired and with remaining individual quota or no individual limit. }
+        present: { type: boolean }
+        quotaUsd: { type: [string, 'null'], description: Null means no individual key quota; account or subscription limits still apply. }
+        quotaUsedUsd: { type: string }
+        remainingUsd: { type: [string, 'null'], description: Shared provider balance; never sum once per customer. }
+        expiresAt: { type: [string, 'null'], format: date-time }
+        lastUsedAt: { type: [string, 'null'], format: date-time }
+        checkedAt: { type: string, format: date-time }
+        credentialId: { type: [string, 'null'], format: uuid }
+        credentialLabel: { type: [string, 'null'] }
+        customerKeys:
+          type: array
+          items:
+            type: object
+            properties:
+              keyId: { type: string, format: uuid }
+              keyHint: { type: string }
+              label: { type: string }
+              userId: { type: string, format: uuid }
+              email: { type: string }
+              remainingUsdt: { type: string }
+    AdminCustomerKey:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        label: { type: string }
+        keyHint: { type: string }
+        status: { type: string }
+        active: { type: boolean }
+        currency: { const: USDT }
+        creditsTotal: { type: string }
+        creditsUsed: { type: string }
+        remainingUsdt: { type: string }
+        expiresAt: { type: [string, 'null'], format: date-time }
+        lastUsedAt: { type: [string, 'null'], format: date-time }
+        upstreams:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+            properties:
+              id: { type: string, format: uuid }
+              label: { type: string }
+              keyHint: { type: string }
+              providerName: { type: string }
+              status: { type: string }
+              localRemainingUsd: { type: [string, 'null'], description: ProxyKey accounting; not a fresh provider confirmation. }
+              externalId: { type: [string, 'null'] }
+              remoteStatus: { type: [string, 'null'] }
+              remotePresent: { type: [boolean, 'null'] }
+              remoteQuotaUsd: { type: [string, 'null'] }
+              remoteUsedUsd: { type: [string, 'null'] }
+              remoteRemainingUsd: { type: [string, 'null'] }
+              remoteExpiresAt: { type: [string, 'null'], format: date-time }
+              remoteCheckedAt: { type: [string, 'null'], format: date-time }
+              remoteStale: { type: boolean }
+              sharedKeyCount: { type: integer }
     ErrorEnvelope:
       type: object
       required: [error]
@@ -889,9 +1148,9 @@ components:
         name: { type: string }
         slug: { type: string }
         description: { type: string }
-        usageAllowance: { type: string, description: Prepaid USD balance equal to the retail purchase price. }
+        usageAllowance: { type: string, description: Prepaid USDT balance equal to the selected package amount. }
         retailPrice: { type: string }
-        currency: { type: string, minLength: 3, maxLength: 3 }
+        currency: { const: USDT }
         durationDays: { type: [integer, 'null'] }
         concurrencyLimit: { type: integer }
         inventory: { type: integer, minimum: 0 }
@@ -929,11 +1188,26 @@ components:
       properties:
         id: { type: string, format: uuid }
         status: { enum: [PENDING, PAID, FULFILLED, FAILED, EXPIRED, REFUNDED] }
-        paymentProvider: { enum: [stripe, nowpayments, mock] }
-        amount: { type: string }
-        currency: { type: string }
+        paymentProvider: { enum: [yookassa, nowpayments, mock, stripe], description: Stripe is supported only for historical orders. }
+        amount: { type: string, description: Amount charged in the payment currency. }
+        currency: { type: string, description: RUB or USDT for new orders; original currency for historical orders. }
+        creditAmount: { type: string, description: USDT credited exactly once after payment confirmation. }
+        usdtRubRate: { type: [string, 'null'], description: RUB per USDT locked when a RUB invoice is created. }
+        exchangeRateAt: { type: [string, 'null'], format: date-time }
+        metadata:
+          type: object
+          additionalProperties: true
+          properties:
+            asset: { const: USDT }
+            network: { const: TON }
+            payAmount: { type: [string, number] }
+            payAddress: { type: string }
+            payinExtraId: { type: [string, 'null'] }
+            testPayment: { type: boolean, description: YooKassa test-mode payment. }
         checkoutUrl: { type: [string, 'null'], format: uri }
         reservedUntil: { type: string, format: date-time }
+        topUpKeyId: { type: [string, 'null'], format: uuid }
+        apiKeyId: { type: [string, 'null'], format: uuid, description: Issued or topped-up key after fulfillment. }
     ApiKey:
       type: object
       properties:
@@ -941,10 +1215,16 @@ components:
         label: { type: string }
         keyHint: { type: string }
         status: { enum: [ACTIVE, PAUSED, EXHAUSTED, EXPIRED, REVOKED] }
-        creditsTotal: { type: string, description: Full paid key balance in USD. }
-        creditsUsed: { type: string, description: Total USD charged to the key. }
+        currency: { const: USDT }
+        creditsTotal: { type: string, description: Total USDT credited by the purchase and confirmed top-ups. }
+        creditsUsed: { type: string, description: Total USDT charged to the key. }
         concurrencyLimit: { type: integer }
-        expiresAt: { type: [string, 'null'], format: date-time }
+        expiresAt: { type: [string, 'null'], format: date-time, description: Null for a key that does not expire. }
+        testKey: { type: boolean }
+        topUpProductIds:
+          type: array
+          description: Package IDs that are compatible with this key.
+          items: { type: string, format: uuid }
         models:
           type: array
           description: Currently verified and priced models with a compatible channel available to this key.
@@ -966,7 +1246,7 @@ components:
         cacheWrite5mTokens: { type: string }
         cacheWrite1hTokens: { type: string }
         imageCount: { type: integer }
-        cost: { type: string, description: USD charged from the key's allowance. }
+        cost: { type: string, description: USDT charged from the key's allowance. }
         status: { enum: [STARTED, SUCCEEDED, FAILED, CANCELLED] }
         httpStatus: { type: [integer, 'null'] }
         errorCode: { type: [string, 'null'] }

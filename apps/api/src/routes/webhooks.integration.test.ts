@@ -30,21 +30,32 @@ integration('signed payment confirmation and recoverable fulfillment', () => {
     return credential!.id;
   }
 
-  async function makeOrder(options: { provider: 'stripe' | 'nowpayments'; externalId: string | null; expired?: boolean; assigned?: boolean }) {
+  async function makeOrder(options: {
+    provider: 'stripe' | 'nowpayments'; externalId: string | null; expired?: boolean; assigned?: boolean;
+    durationDays?: number | null; topUpKeyId?: string;
+  }) {
     const [order] = await sql<{ id: string }[]>`
       INSERT INTO orders (
         user_id, product_id, upstream_credential_id, payment_provider, status, currency, amount,
         price_markup, wholesale_credits, reserved_until, external_id, pool_id, grant_label, grant_duration_days,
-        grant_concurrency_limit, metadata
+        grant_concurrency_limit, metadata, top_up_key_id, credit_amount
       ) VALUES (
         ${userId}, ${productId}, ${options.assigned ? originalCredentialId : null}, ${options.provider},
         ${options.expired ? 'EXPIRED' : 'PENDING'}, 'USD', 20, 2, 10,
         ${new Date(Date.now() + (options.expired ? -60_000 : 3_600_000))}, ${options.externalId}, ${poolId},
-        'Purchased terms', 7, 1, ${sql.json({ payAmount: 10, payCurrency: 'ton' })}
+        'Purchased terms', ${options.durationDays === undefined ? 7 : options.durationDays}, 1,
+        ${sql.json({ payAmount: 10, payCurrency: 'ton' })}, ${options.topUpKeyId ?? null}, 20
       ) RETURNING id
     `;
     orderIds.push(order!.id);
     return order!.id;
+  }
+
+  function deliverTon(externalId: string, orderId: string, actuallyPaid: number, currency: string) {
+    const payload = { payment_id: externalId, payment_status: 'finished', order_id: orderId,
+      price_amount: 20, price_currency: 'usd', actually_paid: actuallyPaid, pay_currency: currency };
+    const signature = createHmac('sha512', config.NOWPAYMENTS_IPN_SECRET).update(canonicalWebhookPayload(payload)).digest('hex');
+    return app.inject({ method: 'POST', url: '/api/webhooks/nowpayments', payload, headers: { 'x-nowpayments-sig': signature } });
   }
 
   beforeAll(async () => {
@@ -73,6 +84,7 @@ integration('signed payment confirmation and recoverable fulfillment', () => {
     await app?.close();
     if (eventIds.length) await sql`DELETE FROM payment_events WHERE event_id IN ${sql(eventIds)}`;
     if (orderIds.length) {
+      await sql`DELETE FROM orders WHERE id IN ${sql(orderIds)} AND top_up_key_id IS NOT NULL`;
       await sql`DELETE FROM api_keys WHERE order_id IN ${sql(orderIds)}`;
       await sql`DELETE FROM orders WHERE id IN ${sql(orderIds)}`;
     }
@@ -127,16 +139,11 @@ integration('signed payment confirmation and recoverable fulfillment', () => {
     expect(finished?.status).toBe('FULFILLED');
   });
 
-  it('issues one key after a full signed TON payment and rejects the wrong coin or amount', async () => {
+  it('still reconciles full signed payments for legacy USD/Toncoin orders and top-ups', async () => {
     const externalId = Date.now().toString();
-    const orderId = await makeOrder({ provider: 'nowpayments', externalId });
+    const orderId = await makeOrder({ provider: 'nowpayments', externalId, durationDays: null });
     eventIds.push(`${externalId}:finished`);
-    const deliver = (actuallyPaid: number, currency: string) => {
-      const payload = { payment_id: externalId, payment_status: 'finished', order_id: orderId,
-        price_amount: 20, price_currency: 'usd', actually_paid: actuallyPaid, pay_currency: currency };
-      const signature = createHmac('sha512', config.NOWPAYMENTS_IPN_SECRET).update(canonicalWebhookPayload(payload)).digest('hex');
-      return app.inject({ method: 'POST', url: '/api/webhooks/nowpayments', payload, headers: { 'x-nowpayments-sig': signature } });
-    };
+    const deliver = (actuallyPaid: number, currency: string) => deliverTon(externalId, orderId, actuallyPaid, currency);
     expect((await deliver(9, 'ton')).statusCode).toBe(400);
     expect((await deliver(10, 'usdtton')).statusCode).toBe(400);
     const [before] = await sql<{ status: string }[]>`SELECT status FROM orders WHERE id = ${orderId}`;
@@ -148,5 +155,15 @@ integration('signed payment confirmation and recoverable fulfillment', () => {
       SELECT status, (SELECT count(*)::int FROM api_keys WHERE order_id = ${orderId}) AS key_count FROM orders WHERE id = ${orderId}
     `;
     expect(after).toEqual({ status: 'FULFILLED', keyCount: 1 });
+
+    const [key] = await sql<{ id: string }[]>`SELECT id FROM api_keys WHERE order_id = ${orderId}`;
+    const depositId = (BigInt(externalId) + 1n).toString();
+    const deposit = await makeOrder({ provider: 'nowpayments', externalId: depositId, topUpKeyId: key!.id, durationDays: null });
+    eventIds.push(`${depositId}:finished`);
+    expect((await deliverTon(depositId, deposit, 9, 'ton')).statusCode).toBe(400);
+    expect((await deliverTon(depositId, deposit, 10, 'ton')).statusCode).toBe(200);
+    expect((await deliverTon(depositId, deposit, 10, 'ton')).json().duplicate).toBe(true);
+    expect(await sql`SELECT id, credits_total::text FROM api_keys WHERE order_id IN (${orderId}, ${deposit})`)
+      .toEqual([{ id: key!.id, creditsTotal: '40.00000000' }]);
   });
 });

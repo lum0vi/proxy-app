@@ -6,6 +6,7 @@ import { AppError } from '../lib/errors.js';
 import { paymentEvents } from '../observability/metrics.js';
 import { markOrderPaid, tryFulfillPaidOrder } from '../services/orders.js';
 import { parseStripeWebhook, verifyNowPaymentsWebhook, type PaymentProviderName } from '../services/payments.js';
+import { getYooKassaPayment } from '../services/yookassa.js';
 
 interface PaymentOrder {
   status: string;
@@ -21,6 +22,7 @@ interface PaymentConfirmation {
   amount: Decimal;
   currency: string;
   crypto?: { paid: Decimal; currency: string };
+  verifiedYooKassa?: { testPayment: boolean };
 }
 
 const uuid = z.string().uuid();
@@ -60,15 +62,26 @@ async function processEvent(
       FROM orders WHERE id = ${confirmation.orderId} AND payment_provider = ${provider} FOR UPDATE
     `;
     if (!order) throw paymentMismatch();
-    if (!order.externalId) throw new AppError(503, 'CHECKOUT_NOT_RECORDED', 'Checkout is not recorded yet; retry this event');
-    if (order.externalId !== confirmation.externalId || order.currency.toLowerCase() !== confirmation.currency
-      || !confirmation.amount.eq(order.amount)) throw paymentMismatch();
+    const recovery = provider === 'yookassa' ? confirmation.verifiedYooKassa : undefined;
+    if (!order.externalId && !recovery) throw new AppError(503, 'CHECKOUT_NOT_RECORDED', 'Checkout is not recorded yet; retry this event');
+    const providerCurrency = String(order.metadata.providerPriceCurrency ?? order.currency).toLowerCase();
+    const providerAmount = decimal(order.metadata.providerPriceAmount ?? order.amount);
+    if ((order.externalId && order.externalId !== confirmation.externalId) || providerCurrency !== confirmation.currency
+      || !providerAmount || !confirmation.amount.eq(providerAmount)) throw paymentMismatch();
     if (confirmation.crypto) {
       const expected = decimal(order.metadata.payAmount);
       if (!expected || expected.lte(0) || confirmation.crypto.paid.lt(expected)
         || confirmation.crypto.currency !== String(order.metadata.payCurrency ?? '').toLowerCase()) {
         throw paymentMismatch();
       }
+    }
+    if (!order.externalId && recovery) {
+      // An invoice can be created before a network/DB failure loses its response.
+      // Only an authenticated YooKassa GET may recover its ID, after checking the
+      // shop, mode, metadata, currency and amount. The incoming notice is not proof.
+      await transaction`UPDATE orders SET external_id = ${confirmation.externalId},
+        metadata = metadata || ${sql.json({ testPayment: recovery.testPayment })}, updated_at = now()
+        WHERE id = ${confirmation.orderId}`;
     }
     // A delayed confirmation must not re-open an order already refunded.
     if (order.status === 'REFUNDED') return { processed: true, fulfill: false };
@@ -83,6 +96,18 @@ async function processEvent(
 const payableStripeEvents = new Set(['checkout.session.completed', 'checkout.session.async_payment_succeeded']);
 
 export async function webhookRoutes(app: FastifyInstance): Promise<void> {
+  app.post('/api/webhooks/yookassa', async request => {
+    const notice = z.object({ type: z.literal('notification'), event: z.string(), object: z.object({ id: z.string().uuid() }) }).parse(request.body);
+    // Treat the webhook as a hint. Only our authenticated GET supplies payment facts.
+    const payment = await getYooKassaPayment(notice.object.id);
+    if (notice.event !== 'payment.succeeded' || payment.status !== 'succeeded' || !payment.paid) return { received: true };
+    const processed = await processEvent('yookassa', `${payment.id}:succeeded`, 'payment.succeeded', {
+      orderId: payment.metadata.orderId, externalId: payment.id,
+      currency: payment.amount.currency.toLowerCase(), amount: new Decimal(payment.amount.value),
+      verifiedYooKassa: { testPayment: payment.test },
+    });
+    return { received: true, ...(!processed && { duplicate: true }) };
+  });
   app.post('/api/webhooks/stripe', { config: { rawBody: true } }, async (request) => {
     const signature = request.headers['stripe-signature'];
     if (typeof signature !== 'string' || !request.rawBody) throw new AppError(400, 'INVALID_WEBHOOK', 'Missing Stripe signature or raw body');

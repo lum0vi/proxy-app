@@ -4,7 +4,7 @@ import { config } from '../config.js';
 Decimal.set({ precision: 32, rounding: Decimal.ROUND_HALF_UP });
 
 export function retailPrice(wholesaleCredits: Decimal.Value, markup: Decimal.Value = config.PRICE_MARKUP): Decimal {
-  return new Decimal(wholesaleCredits).mul(markup).toDecimalPlaces(2);
+  return new Decimal(wholesaleCredits).mul(markup).mul(config.BILLING_USDT_PER_USD).toDecimalPlaces(2);
 }
 
 export function moneyString(value: Decimal.Value, decimals = 2): string {

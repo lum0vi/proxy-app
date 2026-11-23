@@ -35,7 +35,7 @@ async function seed(): Promise<void> {
       '',
       10,
       ${config.DEFAULT_CURRENCY.toUpperCase()},
-      30,
+      NULL,
       2
     )
     ON CONFLICT (slug) DO NOTHING
@@ -51,8 +51,8 @@ async function seed(): Promise<void> {
       INSERT INTO products (
         pool_id, name, slug, wholesale_credits, currency, duration_days, concurrency_limit
       ) VALUES
-        (${pool.id}, 'Starter Key', 'starter-key', 1, ${config.DEFAULT_CURRENCY.toUpperCase()}, 30, 1),
-        (${pool.id}, 'Extended Key', 'extended-key', 25, ${config.DEFAULT_CURRENCY.toUpperCase()}, 30, 2)
+        (${pool.id}, 'Starter Key', 'starter-key', 1, ${config.DEFAULT_CURRENCY.toUpperCase()}, NULL, 1),
+        (${pool.id}, 'Extended Key', 'extended-key', 25, ${config.DEFAULT_CURRENCY.toUpperCase()}, NULL, 2)
       ON CONFLICT (slug) DO NOTHING
     `;
   }

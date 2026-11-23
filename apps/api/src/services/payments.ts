@@ -2,9 +2,10 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 import Stripe from 'stripe';
 import { config } from '../config.js';
 import { AppError } from '../lib/errors.js';
-import { moneyString } from './pricing.js';
+import { Decimal } from 'decimal.js';
+import { createYooKassaCheckout } from './yookassa.js';
 
-export type PaymentProviderName = 'stripe' | 'nowpayments' | 'mock';
+export type PaymentProviderName = 'stripe' | 'nowpayments' | 'yookassa' | 'mock';
 
 export interface CheckoutOrder {
   id: string;
@@ -28,6 +29,7 @@ export async function createCheckout(
   provider: PaymentProviderName,
   order: CheckoutOrder,
 ): Promise<CheckoutResult> {
+  if (provider === 'yookassa') return createYooKassaCheckout(order);
   if (provider === 'mock') {
     if (!config.ALLOW_MOCK_PAYMENTS || config.NODE_ENV === 'production') {
       throw new AppError(400, 'PAYMENT_PROVIDER_DISABLED', 'Mock payments are disabled');
@@ -39,68 +41,53 @@ export async function createCheckout(
     };
   }
 
-  if (provider === 'stripe') {
-    if (!stripe) throw new AppError(503, 'PAYMENT_PROVIDER_UNAVAILABLE', 'Stripe is not configured');
-    const unitAmount = Number.parseInt(moneyString(order.amount, 2).replace('.', ''), 10);
-    const session = await stripe.checkout.sessions.create(
-      {
-        mode: 'payment',
-        adaptive_pricing: { enabled: false },
-        client_reference_id: order.id,
-        customer_email: order.userEmail,
-        metadata: { orderId: order.id },
-        line_items: [
-          {
-            quantity: 1,
-            price_data: {
-              currency: order.currency.toLowerCase(),
-              unit_amount: unitAmount,
-              product_data: { name: order.productName },
-            },
-          },
-        ],
-        success_url: `${config.PUBLIC_APP_URL}/dashboard/orders/${order.id}?payment=success`,
-        cancel_url: `${config.PUBLIC_APP_URL}/dashboard/orders/${order.id}?payment=cancelled`,
-        expires_at: Math.floor(order.reservedUntil.getTime() / 1000),
-      },
-      { idempotencyKey: `order-${order.id}` },
-    );
-    if (!session.url) throw new Error('Stripe did not return a Checkout URL');
-    return { externalId: session.id, checkoutUrl: session.url };
-  }
+  if (provider !== 'nowpayments') throw new AppError(400, 'PAYMENT_PROVIDER_DISABLED', 'This payment method is no longer available');
 
   if (!config.NOWPAYMENTS_API_KEY) {
     throw new AppError(503, 'PAYMENT_PROVIDER_UNAVAILABLE', 'NOWPayments is not configured');
   }
+  if (order.currency !== 'USDT') throw new AppError(400, 'INVALID_CURRENCY', 'Crypto checkout requires USDT');
+  const referenceAmount = new Decimal(order.amount).div(config.BILLING_USDT_PER_USD).toDecimalPlaces(8);
 
-  const response = await fetch(`${config.NOWPAYMENTS_API_URL.replace(/\/$/, '')}/payment`, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': config.NOWPAYMENTS_API_KEY,
-    },
-    body: JSON.stringify({
-      price_amount: Number(order.amount),
-      price_currency: order.currency.toLowerCase(),
-      pay_currency: config.NOWPAYMENTS_PAY_CURRENCY,
-      ipn_callback_url: `${config.PUBLIC_APP_URL}/api/webhooks/nowpayments`,
-      order_id: order.id,
-      order_description: order.productName,
-      is_fixed_rate: true,
-      is_fee_paid_by_user: false,
-    }),
-    signal: AbortSignal.timeout(20_000),
-  });
-  const payload = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+  let response: Response;
+  let payload: Record<string, unknown> | null;
+  try {
+    response = await fetch(`${config.NOWPAYMENTS_API_URL.replace(/\/$/, '')}/payment`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': config.NOWPAYMENTS_API_KEY,
+      },
+      body: JSON.stringify({
+        price_amount: referenceAmount.toNumber(),
+        price_currency: 'usd',
+        pay_amount: Number(order.amount),
+        pay_currency: config.NOWPAYMENTS_PAY_CURRENCY,
+        ipn_callback_url: `${config.PUBLIC_APP_URL}/api/webhooks/nowpayments`,
+        order_id: order.id,
+        order_description: order.productName,
+        is_fixed_rate: true,
+        is_fee_paid_by_user: false,
+      }),
+      redirect: 'error',
+      signal: AbortSignal.timeout(20_000),
+    });
+    payload = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+  } catch {
+    throw new AppError(503, 'PAYMENT_PROVIDER_UNAVAILABLE', 'The payment processor is temporarily unavailable');
+  }
   const amount = payload?.pay_amount;
-  if (!response.ok || !payload?.payment_id || !payload.pay_address
+  if (!response.ok || !payload || !/^\d{1,35}$/.test(String(payload.payment_id ?? ''))
+    || typeof payload.pay_address !== 'string' || !payload.pay_address.trim() || payload.pay_address.length > 512
     || (typeof amount !== 'string' && typeof amount !== 'number') || !/^\d+(?:\.\d+)?$/.test(String(amount)) || Number(amount) <= 0
-    || typeof payload.pay_currency !== 'string' || payload.pay_currency.toLowerCase() !== config.NOWPAYMENTS_PAY_CURRENCY) {
+    || typeof payload.pay_currency !== 'string' || payload.pay_currency.toLowerCase() !== config.NOWPAYMENTS_PAY_CURRENCY
+    || !new Decimal(String(amount)).eq(order.amount)) {
     throw new AppError(502, 'PAYMENT_PROVIDER_ERROR', 'NOWPayments could not create a usable invoice');
   }
 
   const suppliedExpiry = typeof payload.expiration_estimate_date === 'string' ? Date.parse(payload.expiration_estimate_date) : NaN;
   const expiresAt = new Date(Number.isFinite(suppliedExpiry) ? suppliedExpiry : Date.now() + 20 * 60_000);
+  if (expiresAt.getTime() <= Date.now()) throw new AppError(502, 'PAYMENT_PROVIDER_ERROR', 'The payment processor returned an expired invoice');
 
   return {
     externalId: String(payload.payment_id),
@@ -110,7 +97,10 @@ export async function createCheckout(
       payAddress: payload.pay_address,
       payAmount: amount,
       payCurrency: payload.pay_currency,
-      network: payload.network ?? (config.NOWPAYMENTS_PAY_CURRENCY === 'ton' ? 'TON' : null),
+      network: 'TON',
+      asset: 'USDT',
+      providerPriceCurrency: 'usd',
+      providerPriceAmount: referenceAmount.toString(),
       payinExtraId: payload.payin_extra_id,
       expirationEstimateDate: expiresAt.toISOString(),
     },

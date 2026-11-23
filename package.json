@@ -13,6 +13,7 @@
     "build": "npm run build --workspace @proxi/api && npm run build --workspace @proxi/web",
     "dev": "concurrently -n api,web -c cyan,magenta \"npm run dev --workspace @proxi/api\" \"npm run dev --workspace @proxi/web\"",
     "typecheck": "npm run typecheck --workspace @proxi/api && npm run typecheck --workspace @proxi/web",
+    "production:check": "npm run production:check --workspace @proxi/api",
     "test": "npm run test --workspace @proxi/api && npm run test --workspace @proxi/web",
     "test:coverage": "npm run test:coverage --workspace @proxi/api && npm run test:coverage --workspace @proxi/web",
     "db:migrate": "npm run db:migrate --workspace @proxi/api",

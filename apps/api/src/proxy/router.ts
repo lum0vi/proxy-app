@@ -29,6 +29,7 @@ interface KeyContext {
   poolId: string;
   amount: string;
   paymentProvider: string;
+  testPayment: boolean;
   wholesaleCredits: string;
   userStatus: string;
   poolActive: boolean;
@@ -82,7 +83,9 @@ function keyHash(request: FastifyRequest): string {
 async function resolveKey(db: postgres.Sql | postgres.TransactionSql, hash: string, lock = false): Promise<KeyContext> {
   const [key] = await db<KeyContext[]>`
     SELECT ak.id, ak.status, ak.credits_total::text, ak.credits_used::text, ak.concurrency_limit, ak.expires_at,
-      ak.upstream_credential_id, uc.pool_id AS primary_pool_id, o.pool_id, o.amount::text, o.payment_provider, o.wholesale_credits::text,
+      ak.upstream_credential_id, uc.pool_id AS primary_pool_id, o.pool_id,
+      COALESCE(o.credit_amount, o.amount)::text AS amount, o.payment_provider, o.wholesale_credits::text,
+      (o.payment_provider = 'mock' OR COALESCE(o.metadata->>'testPayment' = 'true', false)) AS test_payment,
       u.status AS user_status, up.active AS pool_active
     FROM api_keys ak JOIN users u ON u.id = ak.user_id
     JOIN orders o ON o.id = ak.order_id
@@ -92,6 +95,10 @@ async function resolveKey(db: postgres.Sql | postgres.TransactionSql, hash: stri
     ${lock ? db`FOR UPDATE OF ak` : db``}
   `;
   if (!key) throw new AppError(401, 'INVALID_API_KEY', 'Invalid API key');
+  if (key.testPayment && (config.NODE_ENV === 'production'
+    || (key.paymentProvider === 'mock' ? !config.ALLOW_MOCK_PAYMENTS : !config.YOOKASSA_TEST_MODE))) {
+    throw new AppError(403, 'TEST_KEY_DISABLED', 'Test payment keys are not enabled in this environment');
+  }
   if (key.userStatus !== 'ACTIVE') throw new AppError(403, 'USER_INACTIVE', 'This account is suspended');
   if (key.status === 'EXHAUSTED' || (key.status === 'ACTIVE' && new Decimal(key.creditsUsed).gte(key.creditsTotal))) {
     throw new AppError(402, 'CREDITS_EXHAUSTED', 'API key credits are exhausted');
@@ -106,7 +113,7 @@ async function resolveKey(db: postgres.Sql | postgres.TransactionSql, hash: stri
 
 const busy = () => new AppError(429, 'UPSTREAM_BUSY', 'The model is busy. Retry shortly');
 
-async function activeCredential(transaction: postgres.TransactionSql, key: KeyContext, rate: ModelRate, model: string): Promise<CredentialContext> {
+async function activeCredential(transaction: postgres.TransactionSql, key: KeyContext, rate: ModelRate, model: string, minimumBudget: string): Promise<CredentialContext> {
   const [assignment] = await transaction<{ upstreamCredentialId: string }[]>`
     SELECT upstream_credential_id FROM api_key_channel_assignments
     WHERE api_key_id = ${key.id} AND pool_id = ${rate.poolId}
@@ -121,6 +128,10 @@ async function activeCredential(transaction: postgres.TransactionSql, key: KeyCo
       JOIN sellable_upstream_slots s ON s.id = uc.id
       WHERE uc.id = ${id} AND uc.pool_id = ${rate.poolId} AND ${model} = ANY(uc.available_models)
         AND (NOT s.test_only OR ${key.paymentProvider === 'mock'})
+        AND (uc.spend_limit IS NULL OR uc.spend_limit - uc.spend_used - COALESCE((
+          SELECT sum(lease.reserved_cost) FROM request_leases lease
+          WHERE lease.upstream_credential_id = uc.id AND lease.expires_at > now()
+        ), 0) >= ${minimumBudget}::numeric)
       FOR UPDATE OF uc
     `;
     return credential;
@@ -128,7 +139,16 @@ async function activeCredential(transaction: postgres.TransactionSql, key: KeyCo
 
   const assigned = assignedId ? await find(assignedId) : undefined;
   if (assigned) return assigned;
-  const replacement = await selectCredentialWithCapacity(transaction, rate.poolId, { model, allowTest: key.paymentProvider === 'mock' });
+  const replacement = await selectCredentialWithCapacity(transaction, rate.poolId, {
+    model, minimumBudget, apiKeyId: key.id, allowTest: key.paymentProvider === 'mock',
+  }).catch(async error => {
+    if (assignedId && error instanceof AppError && error.code === 'NO_UPSTREAM_CAPACITY') {
+      const [previousModel] = await transaction`SELECT 1 FROM upstream_credentials
+        WHERE id = ${assignedId} AND ${model} = ANY(available_models)`;
+      if (previousModel) throw unavailable();
+    }
+    throw error;
+  });
   const credential = await find(replacement.id);
   if (!credential) throw unavailable();
   if (rate.poolId === key.primaryPoolId) {
@@ -190,7 +210,7 @@ async function acquireLease(hash: string, endpoint: string, requestBody: Inferen
           });
           const estimate = estimatedCost.toDecimalPlaces(8);
           const customerEstimate = retailUsageCost(estimatedCost, multiplier);
-          const credential = await activeCredential(attempt, key, rate, model);
+          const credential = await activeCredential(attempt, key, rate, model, estimate.toFixed(8));
           const [leases] = await attempt<{ keyCount: number; credentialCount: number; keyReserved: string; credentialReserved: string }[]>`
             SELECT count(*) FILTER (WHERE api_key_id = ${key.id})::int AS key_count,
               count(*) FILTER (WHERE upstream_credential_id = ${credential.id})::int AS credential_count,
@@ -201,7 +221,7 @@ async function acquireLease(hash: string, endpoint: string, requestBody: Inferen
           if ((leases?.keyCount ?? 0) >= key.concurrencyLimit) throw new AppError(429, 'KEY_CONCURRENCY_LIMIT', 'API key concurrency limit reached');
           if ((leases?.credentialCount ?? 0) >= credential.maxConcurrency) throw busy();
           if (customerEstimate.gt(new Decimal(key.creditsTotal).sub(key.creditsUsed).sub(leases?.keyReserved ?? '0'))) {
-            throw new AppError(402, 'INSUFFICIENT_CREDITS', 'Not enough balance for this request. Reduce the output limit or obtain a new key');
+            throw new AppError(402, 'INSUFFICIENT_CREDITS', 'Not enough balance for this request. Reduce the output limit or add balance');
           }
           if (credential.spendLimit !== null
             && estimate.gt(new Decimal(credential.spendLimit).sub(credential.spendUsed).sub(leases?.credentialReserved ?? '0'))) {
@@ -423,7 +443,9 @@ export async function proxyRoutes(app: FastifyInstance): Promise<void> {
         await finalize({
           usage: hasUsage ?? (ok && body.images ? { ...emptyUsage, imageCount: body.images } : null),
           status: ok ? 'SUCCEEDED' : 'FAILED', httpStatus: response.status,
-          errorCode: !hasUsage && !body.images ? 'USAGE_UNCONFIRMED' : ok ? undefined : 'UPSTREAM_STREAM_FAILED',
+          // message_start can contain partial Anthropic usage. Without a terminal
+          // event it is not a final bill, even when those counters are non-zero.
+          errorCode: (!hasUsage && !body.images) || !tracker.terminal ? 'USAGE_UNCONFIRMED' : ok ? undefined : 'UPSTREAM_STREAM_FAILED',
         });
         if (!tracker.terminal) reply.raw.destroy();
         else reply.raw.end();
@@ -456,7 +478,9 @@ export async function proxyRoutes(app: FastifyInstance): Promise<void> {
       statusLabel = clientClosed ? '499' : timeout.aborted ? '504' : '502';
       try {
         const known = tracker?.observedUsage() ?? null;
-        const unconfirmed = upstreamAttempted && !known && (upstreamStatus === undefined || (upstreamStatus >= 200 && upstreamStatus < 300));
+        const partialStream = streamOpened && tracker?.terminal !== 'completed' && tracker?.terminal !== 'incomplete';
+        const unconfirmed = upstreamAttempted && (!known || partialStream)
+          && (upstreamStatus === undefined || (upstreamStatus >= 200 && upstreamStatus < 300));
         await finalize({ usage: known, status: clientClosed ? 'CANCELLED' : 'FAILED', httpStatus: upstreamStatus,
           errorCode: unconfirmed ? `${code}_USAGE_UNCONFIRMED` : code });
       } catch {

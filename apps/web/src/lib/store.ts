@@ -33,22 +33,22 @@ export interface Product {
   unpricedModels: ModelOption[];
 }
 
-export type PaymentMethod = 'stripe' | 'nowpayments' | 'mock';
+export type PaymentMethod = 'yookassa' | 'nowpayments' | 'mock';
+export type PaymentCurrency = 'RUB' | 'USDT';
 
 export interface StoreCatalog {
   products: Product[];
   paymentMethods: PaymentMethod[];
+  paymentCurrencies: PaymentCurrency[];
   cryptoCurrency: string | null;
+  cryptoNetwork: string | null;
+  currency: 'USDT';
 }
 
 export interface PriceRates {
-  usdToRub: string;
-  usdToTon: string;
+  usdtToRub: string;
   checkedAt: string;
-}
-
-export function ton(value: number, locale: Locale) {
-  return `${new Intl.NumberFormat(locale, { maximumFractionDigits: 4 }).format(value)} TON`;
+  source: 'coingecko' | 'configured';
 }
 
 export interface CustomerKey {
@@ -58,15 +58,19 @@ export interface CustomerKey {
   status: string;
   creditsTotal: string;
   creditsUsed: string;
+  currency: 'USDT';
   concurrencyLimit: number;
   expiresAt: string | null;
+  testKey: boolean;
+  topUpProductIds: string[];
   lastUsedAt: string | null;
   createdAt: string;
   models: string[];
   modelOptions: ModelOption[];
 }
 
-export function money(value: string | number, locale: Locale, currency = 'USD', maximumFractionDigits = 2) {
+export function money(value: string | number, locale: Locale, currency = 'USDT', maximumFractionDigits = 2) {
+  if (currency === 'USDT') return `${new Intl.NumberFormat(locale, { minimumFractionDigits: 2, maximumFractionDigits }).format(Number(value))} USDT`;
   return new Intl.NumberFormat(locale, { style: 'currency', currency, maximumFractionDigits }).format(Number(value));
 }
 

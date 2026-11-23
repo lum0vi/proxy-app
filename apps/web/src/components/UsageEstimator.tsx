@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../lib/api';
 import { usePreferences } from '../lib/preferences';
-import { money, type Product } from '../lib/store';
+import { money, type PriceRates, type Product } from '../lib/store';
 import { defaultModel } from '../lib/setup';
 
 interface Estimate {
@@ -28,7 +28,7 @@ const examples = [
   { label: ['Большой контекст', 'Long context'], input: 300000, cached: 120000, output: 3000 },
 ];
 
-export function UsageEstimator({ products }: { products: Product[] }) {
+export function UsageEstimator({ products, exchange }: { products: Product[]; exchange: PriceRates | null }) {
   const { locale } = usePreferences();
   const ru = locale === 'ru';
   const [selectedProduct, setSelectedProduct] = useState('');
@@ -102,7 +102,8 @@ export function UsageEstimator({ products }: { products: Product[] }) {
       <div aria-live="polite">
         <span>{ru ? 'Примерно запросов на пакет' : 'Estimated requests per package'}</span>
         <strong>{result?.requestsPerKey != null ? new Intl.NumberFormat(locale).format(BigInt(result.requestsPerKey)) : '—'}</strong>
-        <p>{ru ? 'Расход на запрос' : 'Cost per request'} {result ? money(result.cost, locale, 'USD', 8) : '—'}</p>
+        <p>{ru ? 'Расход на запрос' : 'Cost per request'} {result ? money(result.cost, locale, 'USDT', 8) : '—'}</p>
+        {result && exchange && <p>≈ {money(Number(result.cost) * Number(exchange.usdtToRub), locale, 'RUB', 4)}</p>}
         {result?.longContextApplied && <p>{ru ? 'Учтена ставка для длинного контекста' : 'Long-context rate applied'}</p>}
         {result?.peakApplied && <p>{ru ? 'Применена ставка часов пик' : 'Peak-hour rate applied'}</p>}
         {url && quote.url === url && !result && <button type="button" className="text-button" onClick={() => { setQuote({ url: '' }); setAttempt(attempt + 1); }}>{ru ? 'Повторить расчёт' : 'Retry estimate'}</button>}
@@ -112,10 +113,13 @@ export function UsageEstimator({ products }: { products: Product[] }) {
   </div>;
 }
 
-export function ModelCatalog({ products }: { products: Product[] }) {
+export function ModelCatalog({ products, exchange }: { products: Product[]; exchange: PriceRates | null }) {
   const { locale } = usePreferences();
   const ru = locale === 'ru';
   const [productId, setProductId] = useState('');
+  const [currency, setCurrency] = useState<'USDT' | 'RUB'>('USDT');
+  const displayCurrency = exchange ? currency : 'USDT';
+  const ratePrice = (value: string) => money(Number(value) * (displayCurrency === 'RUB' ? Number(exchange!.usdtToRub) : 1), locale, displayCurrency, 8);
   const [selectedFamily, setSelectedFamily] = useState('');
   const withRates = products.filter(({ models, unpricedModels }) => models.length + unpricedModels.length > 0);
   const product = withRates.find(({ id }) => id === productId) ?? withRates[0];
@@ -132,12 +136,16 @@ export function ModelCatalog({ products }: { products: Product[] }) {
           <option value="">{ru ? 'Все семейства' : 'All families'}</option>{families.map((name) => <option key={name}>{name}</option>)}
         </select></label>
       </div>
+      {exchange && <div className="segmented" aria-label={ru ? 'Валюта ставок' : 'Rate currency'}>
+        {(['USDT', 'RUB'] as const).map(value => <button type="button" key={value} disabled={value === 'RUB' && !exchange} aria-pressed={displayCurrency === value} className={displayCurrency === value ? 'active' : ''} onClick={() => setCurrency(value)}>{value === 'RUB' ? '₽' : 'USDT'}</button>)}
+      </div>}
+      {displayCurrency === 'RUB' && <p className="form-hint">{ru ? 'Справочный эквивалент по текущему курсу. Списание с баланса — в USDT.' : 'Indicative equivalent at the current exchange rate. Usage is charged in USDT.'}</p>}
       <div className="table-scroll"><table>
         <thead><tr>{[ru ? 'Модель' : 'Model', ru ? 'Вход' : 'Input', ru ? 'Кэш' : 'Cache', ru ? 'Ответ' : 'Output', ru ? 'За запрос' : 'Per request', ru ? 'Доступ' : 'Access'].map((label) => <th key={label}>{label}</th>)}</tr></thead>
         <tbody>{rates.map((rate) => <tr key={rate.model}>
           <td><code>{rate.model}</code>{rate.longContextThreshold && <small className="catalog-status">{Number(rate.longContextMultiplier)}× &gt; {new Intl.NumberFormat(locale).format(rate.longContextThreshold)}</small>}{Number(rate.peakMultiplier) > 1 && <small className="catalog-status">{Number(rate.peakMultiplier)}× {ru ? 'в часы пик' : 'at peak times'}</small>}</td>
-          {[rate.inputPerMillion, rate.cachedInputPerMillion, rate.outputPerMillion].map((value, index) => <td key={index}>{rate.protocol === 'IMAGES' ? '—' : money(value, locale, 'USD', 8)}</td>)}
-          <td>{Number(rate.perRequest) > 0 ? money(rate.perRequest, locale, 'USD', 8) : '—'}</td>
+          {[rate.inputPerMillion, rate.cachedInputPerMillion, rate.outputPerMillion].map((value, index) => <td key={index}>{rate.protocol === 'IMAGES' ? '—' : ratePrice(value)}</td>)}
+          <td>{Number(rate.perRequest) > 0 ? ratePrice(rate.perRequest) : '—'}</td>
           <td><span className={`catalog-status${rate.available ? ' available' : ''}`}>{rate.available ? (ru ? 'Доступна' : 'Available') : (ru ? 'Недоступна' : 'Unavailable')}</span></td>
         </tr>)}{product.unpricedModels.filter(visible).map((rate) => <tr key={rate.model}>
           <td><code>{rate.model}</code></td><td colSpan={4}>—</td><td><span className="catalog-status">{ru ? 'Ставка не задана' : 'Rate pending'}</span></td>

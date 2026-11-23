@@ -15,6 +15,14 @@ const keyListSchema = z.object({
   items: z.array(z.object({ id, name: z.string() })),
   total: z.number().int().nonnegative(),
 });
+const date = z.string().refine(value => Number.isFinite(Date.parse(value))).nullable().optional();
+const inventoryKeySchema = z.object({
+  id, name: z.string(), group_id: id.nullable().optional(), key: token, quota: usd, quota_used: usd,
+  status: z.string(), expires_at: date, last_used_at: date,
+  group: z.object({ name: z.string() }).nullable().optional(),
+});
+const inventoryPageSchema = z.object({ items: z.array(inventoryKeySchema), total: z.number().int().nonnegative() });
+export type CeInventoryKey = z.infer<typeof inventoryKeySchema>;
 const sessionSchema = z.object({
   access_token: token, refresh_token: token,
   expires_in: z.number().int().positive().max(365 * 86400),
@@ -73,6 +81,27 @@ export class CeManagement {
 
   async groups(accessToken: string) {
     return this.request('/groups/available', groupsSchema, accessToken);
+  }
+
+  async keys(accessToken: string): Promise<CeInventoryKey[]> {
+    const result: CeInventoryKey[] = [];
+    const seen = new Set<number>();
+    let total: number | undefined;
+    for (let page = 1; page <= 100; page++) {
+      const query = new URLSearchParams({ page: String(page), page_size: '100', sort_by: 'created_at', sort_order: 'asc' });
+      const batch = await this.request(`/keys?${query}`, inventoryPageSchema, accessToken);
+      if (batch.total > 10_000) throw new CeManagementError('CE_KEY_LIST_TOO_LARGE');
+      if (total !== undefined && batch.total !== total) throw new CeManagementError('CE_KEY_LIST_CHANGED');
+      total = batch.total;
+      for (const key of batch.items) {
+        if (seen.has(key.id)) throw new CeManagementError('CE_KEY_LIST_CHANGED');
+        seen.add(key.id);
+        result.push(key);
+      }
+      if (result.length === total) return result;
+      if (result.length > total || batch.items.length === 0) throw new CeManagementError('CE_KEY_LIST_CHANGED');
+    }
+    throw new CeManagementError('CE_KEY_LIST_TOO_LARGE');
   }
 
   async keyByName(accessToken: string, name: string) {

@@ -7,6 +7,9 @@ import { encryptSecret, keyHint, upstreamKeyFingerprint } from '../lib/crypto.js
 import { AppError, assertFound } from '../lib/errors.js';
 import { protocols } from '../proxy/protocols.js';
 import { isDuplicateUpstreamKey, refreshUpstreamCatalog } from '../services/upstream-catalog.js';
+import { updateUserAccess } from '../services/user-access.js';
+import { providerBalanceStatus } from '../services/provider-balances.js';
+import { listProviderKeys, listUserKeys, requestProviderKeyRefresh } from '../services/provider-keys.js';
 import type { AuthenticatedRequest } from '../types.js';
 
 const poolSchema = z.object({
@@ -35,6 +38,11 @@ const credentialSchema = z.object({
   spendLimit: z.string().regex(/^\d+(?:\.\d+)?$/).nullable().optional(),
   testOnly: z.boolean().default(false),
 });
+const keyListQuery = z.object({
+  activeOnly: z.enum(['true', 'false']).default('true').transform(value => value === 'true'),
+  page: z.coerce.number().int().min(1).max(100_000).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(25),
+});
 
 const productSchema = z.object({
   poolId: z.string().uuid(),
@@ -42,8 +50,8 @@ const productSchema = z.object({
   slug: z.string().regex(/^[a-z0-9-]+$/).max(80),
   description: z.string().max(1000).default(''),
   wholesaleCredits: z.string().regex(/^\d+(?:\.\d+)?$/),
-  currency: z.string().transform((value) => value.toUpperCase()).pipe(z.literal('USD')),
-  durationDays: z.number().int().positive().nullable(),
+  currency: z.string().transform((value) => value.toUpperCase()).pipe(z.literal('USDT')),
+  durationDays: z.number().int().positive().nullable().optional(),
   concurrencyLimit: z.number().int().min(1).max(1000),
   active: z.boolean().default(true),
 });
@@ -73,13 +81,33 @@ async function audit(request: FastifyRequest, action: string, entityType: string
 export async function adminRoutes(app: FastifyInstance): Promise<void> {
   app.addHook('preHandler', requireAdmin);
 
+  app.get('/api/admin/provider-keys', request => listProviderKeys(keyListQuery.parse(request.query)));
+
+  app.post('/api/admin/provider-keys/refresh', async (request, reply) => {
+    if (!config.ceKeySyncEnabled) throw new AppError(409, 'CE_KEY_SYNC_DISABLED', 'Enable CE_KEY_SYNC_ENABLED in the environment');
+    await requestProviderKeyRefresh();
+    await audit(request, 'REFRESH', 'PROVIDER_KEYS');
+    return reply.code(202).send({ queued: true });
+  });
+
+  app.get('/api/admin/users/:id/keys', async request => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    return assertFound(await listUserKeys(id, keyListQuery.parse(request.query)), 'USER_NOT_FOUND', 'User not found');
+  });
+
+  app.get('/api/admin/provider-balances', async () => ({
+    monitoring: { ceEnabled: config.ceBalanceMonitorEnabled, intervalMs: config.PROVIDER_BALANCE_CHECK_INTERVAL_MS,
+      smtpConfigured: Boolean(config.SMTP_HOST), lowThresholdUsd: config.PROVIDER_BALANCE_LOW_USD },
+    balances: await providerBalanceStatus(),
+  }));
+
   app.get('/api/admin/stats', async () => {
     const [stats] = await sql<Record<string, unknown>[]>`
       SELECT
         (SELECT count(*)::int FROM users) AS users,
         (SELECT count(*)::int FROM api_keys WHERE status = 'ACTIVE') AS active_keys,
         (SELECT count(*)::int FROM upstream_credentials WHERE status IN ('ACTIVE', 'DEGRADED')) AS upstream_keys,
-        (SELECT COALESCE(sum(amount), 0)::text FROM orders WHERE status = 'FULFILLED') AS gross_revenue,
+        (SELECT COALESCE(sum(COALESCE(credit_amount, amount)), 0)::text FROM orders WHERE status = 'FULFILLED') AS gross_revenue,
         (SELECT COALESCE(sum(cost), 0)::text FROM usage_records) AS wholesale_cost,
         (SELECT count(*)::int FROM orders WHERE status = 'PENDING') AS pending_orders,
         (SELECT count(*)::int FROM orders WHERE status = 'PAID') AS paid_orders
@@ -220,7 +248,7 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       FROM products p JOIN upstream_pools up ON up.id = p.pool_id
       ORDER BY p.created_at
     `;
-    return { products, priceMarkup: config.PRICE_MARKUP };
+    return { products, priceMarkup: config.PRICE_MARKUP, billingUsdtPerUsd: config.BILLING_USDT_PER_USD };
   });
 
   app.post('/api/admin/products', async (request, reply) => {
@@ -231,7 +259,7 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
         concurrency_limit, active
       ) VALUES (
         ${body.poolId}, ${body.name}, ${body.slug}, ${body.description}, ${body.wholesaleCredits},
-        ${body.currency}, ${body.durationDays}, ${body.concurrencyLimit}, ${body.active}
+        ${body.currency}, ${body.durationDays ?? null}, ${body.concurrencyLimit}, ${body.active}
       ) ON CONFLICT (slug) DO NOTHING RETURNING id
     `;
     const product = assertFound(rows[0], 'PRODUCT_EXISTS', 'A product with this slug already exists');
@@ -245,8 +273,7 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     const [current] = await sql<Record<string, unknown>[]>`SELECT * FROM products WHERE id = ${params.id}`;
     assertFound(current, 'PRODUCT_NOT_FOUND', 'Product not found');
     const value = { ...current, ...body } as Record<string, unknown>;
-    const rawDurationDays = value.durationDays ?? value.duration_days;
-    const durationDays = rawDurationDays === null || rawDurationDays === undefined ? null : Number(rawDurationDays);
+    const durationDays = value.durationDays === null ? null : Number(value.durationDays);
     await sql`
       UPDATE products SET pool_id = ${String(value.poolId ?? value.pool_id)}, name = ${String(value.name)},
         slug = ${String(value.slug)}, description = ${String(value.description)},
@@ -304,7 +331,7 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       SELECT u.id, u.email::text, u.name, u.role, u.status, u.wallet_network, u.wallet_address,
         u.created_at,
         (SELECT count(*)::int FROM api_keys ak WHERE ak.user_id = u.id) AS key_count,
-        (SELECT COALESCE(sum(o.amount), 0)::text FROM orders o
+        (SELECT COALESCE(sum(o.credit_amount), 0)::text FROM orders o
           WHERE o.user_id = u.id AND o.status = 'FULFILLED') AS spent
       FROM users u
       ORDER BY u.created_at DESC LIMIT 500
@@ -316,24 +343,7 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const body = z.object({ role: z.enum(['ADMIN', 'USER']).optional(), status: z.enum(['ACTIVE', 'SUSPENDED']).optional() }).parse(request.body);
     const actorId = (request as AuthenticatedRequest).authUser.id;
-    if (params.id === actorId && body.status === 'SUSPENDED') {
-      throw new AppError(409, 'CANNOT_SUSPEND_SELF', 'You cannot suspend your own account');
-    }
-    if (body.role === 'USER') {
-      const [target] = await sql<{ role: string }[]>`SELECT role FROM users WHERE id = ${params.id}`;
-      if (target?.role === 'ADMIN') {
-        const [admins] = await sql<{ count: number }[]>`SELECT count(*)::int AS count FROM users WHERE role = 'ADMIN' AND status = 'ACTIVE'`;
-        if ((admins?.count ?? 0) <= 1) {
-          throw new AppError(409, 'LAST_ADMIN', 'The last active administrator cannot be demoted');
-        }
-      }
-    }
-    const rows = await sql<{ id: string }[]>`
-      UPDATE users SET role = COALESCE(${body.role ?? null}, role),
-        status = COALESCE(${body.status ?? null}, status), updated_at = now()
-      WHERE id = ${params.id} RETURNING id
-    `;
-    assertFound(rows[0], 'USER_NOT_FOUND', 'User not found');
+    await updateUserAccess(sql, actorId, params.id, body);
     await audit(request, 'UPDATE', 'USER', params.id, body);
     return { ok: true };
   });
@@ -342,7 +352,8 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     const orders = await sql<Record<string, unknown>[]>`
       SELECT o.id, u.email::text AS user_email, o.grant_label AS product_name, up.name AS provider_name,
         o.payment_provider, o.status, o.amount::text, o.currency, o.price_markup::text,
-        o.wholesale_credits::text, o.external_id, o.paid_at, o.fulfilled_at, o.created_at
+        COALESCE(o.credit_amount, o.amount)::text AS credit_amount,
+        o.wholesale_credits::text, o.external_id, o.paid_at, o.fulfilled_at, o.created_at, o.top_up_key_id
       FROM orders o
       JOIN users u ON u.id = o.user_id
       JOIN upstream_pools up ON up.id = o.pool_id
