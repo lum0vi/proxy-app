@@ -80,7 +80,7 @@ export async function processProviderBalanceAlerts(deliver: typeof sendMail = se
         if (!smtpConfigured) throw new Error('SMTP_NOT_CONFIGURED');
         await deliver({
           to: config.ADMIN_ALERT_EMAIL,
-          subject: `ProxyKey: низкий баланс провайдера ${alert.provider}`,
+          subject: `Ksapi: низкий баланс провайдера ${alert.provider}`,
           text: `На аккаунте провайдера ${alert.provider} осталось $${new Decimal(alert.balanceUsd).toFixed(2)}. `
             + `Порог уведомления $${new Decimal(alert.thresholdUsd).toFixed(2)}. Пополните аккаунт провайдера, чтобы продолжить обслуживание ключей.\n\n`
             + `Баланс проверен через API провайдера. Панель администратора: ${config.PUBLIC_APP_URL}/admin/providers`,

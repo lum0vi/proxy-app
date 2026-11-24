@@ -9,7 +9,7 @@ const booleanString = (defaultValue = false) => envBoolean.default(defaultValue)
 
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
-  APP_NAME: z.string().min(1).default('ProxyKey'),
+  APP_NAME: z.string().min(1).default('Ksapi'),
   PUBLIC_APP_URL: z.string().url().default('http://localhost:8080'),
   ADDITIONAL_BROWSER_ORIGINS: z.string().default(''),
   API_HOST: z.string().default('0.0.0.0'),
@@ -75,7 +75,7 @@ const envSchema = z.object({
   SMTP_SECURE: booleanString(),
   SMTP_USER: z.string().default(''),
   SMTP_PASSWORD: z.string().default(''),
-  SMTP_FROM: z.string().default('ProxyKey <noreply@example.com>'),
+  SMTP_FROM: z.string().default('Ksapi <noreply@example.com>'),
   ADMIN_ALERT_EMAIL: z.string().email().default('admin@example.com'),
   KEY_EXPIRY_NOTICE_DAYS: z.string().default('7,3,1'),
   KEY_BALANCE_NOTICE_PERCENT: z.string().default('20,10,5'),

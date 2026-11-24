@@ -14,11 +14,11 @@ const clients = [
 ] as const;
 
 const instructions = {
-  codex: ['Добавьте настройки в пользовательский config.toml. Перед запуском Codex CLI, приложения или редактора сделайте переменную PROXYKEY_API_KEY доступной процессу.', 'Merge the settings into your user config.toml. Make PROXYKEY_API_KEY available to the CLI, desktop app, or editor before launching it.'],
-  claude: ['Добавьте эти настройки в ~/.claude/settings.json и подставьте свой ключ ProxyKey. Затем запустите Claude Code.', 'Merge these settings into ~/.claude/settings.json and insert your ProxyKey API key. Then launch Claude Code.'],
-  opencode: ['Добавьте настройки в пользовательский opencode.json. Запустите OpenCode 2 с переменной PROXYKEY_API_KEY и выберите модель через /models.', 'Merge the settings into your user opencode.json. Start OpenCode 2 with PROXYKEY_API_KEY and choose the model with /models.'],
-  curl: ['Установите PROXYKEY_API_KEY и отправьте запрос.', 'Set PROXYKEY_API_KEY and send the request.'],
-  node: ['Установите пакет openai в проект и передайте PROXYKEY_API_KEY процессу Node.js.', 'Install the openai package in your project and provide PROXYKEY_API_KEY to the Node.js process.'],
+  codex: ['Добавьте настройки в пользовательский config.toml. Перед запуском Codex CLI, приложения или редактора сделайте переменную KSAPI_API_KEY доступной процессу.', 'Merge the settings into your user config.toml. Make KSAPI_API_KEY available to the CLI, desktop app, or editor before launching it.'],
+  claude: ['Добавьте эти настройки в ~/.claude/settings.json и подставьте свой ключ Ksapi. Затем запустите Claude Code.', 'Merge these settings into ~/.claude/settings.json and insert your Ksapi API key. Then launch Claude Code.'],
+  opencode: ['Добавьте настройки в пользовательский opencode.json. Запустите OpenCode 2 с переменной KSAPI_API_KEY и выберите модель через /models.', 'Merge the settings into your user opencode.json. Start OpenCode 2 with KSAPI_API_KEY and choose the model with /models.'],
+  curl: ['Установите KSAPI_API_KEY и отправьте запрос.', 'Set KSAPI_API_KEY and send the request.'],
+  node: ['Установите пакет openai в проект и передайте KSAPI_API_KEY процессу Node.js.', 'Install the openai package in your project and provide KSAPI_API_KEY to the Node.js process.'],
 } as const;
 
 function accepts(client: (typeof clients)[number]['id'], protocol: Protocol) {
@@ -45,11 +45,11 @@ export function ClientSetup({ models = [] }: { models?: ModelOption[] }) {
   const model = choices.find((choice) => optionId(choice) === selectedModel)
     ?? choices.find((choice) => choice.model === defaultModel) ?? choices[0]!;
   const snippets = connectionSnippets(window.location.origin, model.model, model.protocol);
-  const exportKey = system === 'posix' ? `export PROXYKEY_API_KEY="${exampleKey}"` : `$env:PROXYKEY_API_KEY = "${exampleKey}"`;
+  const exportKey = system === 'posix' ? `export KSAPI_API_KEY="${exampleKey}"` : `$env:KSAPI_API_KEY = "${exampleKey}"`;
   let code = snippets[client.id];
   if (client.id === 'curl' && system === 'powershell') {
     const { url, body, anthropic } = sampleRequest(window.location.origin, model);
-    code = `@'\n${JSON.stringify(body)}\n'@ | curl.exe -N "${url}" \x60\n  -H "Authorization: Bearer $env:PROXYKEY_API_KEY" \x60\n  -H "Content-Type: application/json" ${anthropic ? '-H "anthropic-version: 2023-06-01" ' : ''}--data-binary '@-'`;
+    code = `@'\n${JSON.stringify(body)}\n'@ | curl.exe -N "${url}" \x60\n  -H "Authorization: Bearer $env:KSAPI_API_KEY" \x60\n  -H "Content-Type: application/json" ${anthropic ? '-H "anthropic-version: 2023-06-01" ' : ''}--data-binary '@-'`;
   }
 
   return <div className="client-setup">

@@ -79,8 +79,8 @@ function message(notice: NoticeRow): { subject: string; text: string } {
   if (notice.kind === 'KEY_CREATED') {
     const balance = new Decimal(notice.detail || 0).toFixed(2);
     return ru
-      ? { subject: 'Ваш ключ ProxyKey готов', text: `Ключ «${notice.label}» активирован. Баланс ${balance} USDT. Откройте кабинет, чтобы скопировать ключ.` }
-      : { subject: 'Your ProxyKey is ready', text: `Key “${notice.label}” is active with a ${balance} USDT balance. Open your dashboard to copy the key.` };
+      ? { subject: 'Ваш ключ Ksapi готов', text: `Ключ «${notice.label}» активирован. Баланс ${balance} USDT. Откройте кабинет, чтобы скопировать ключ.` }
+      : { subject: 'Your Ksapi is ready', text: `Key “${notice.label}” is active with a ${balance} USDT balance. Open your dashboard to copy the key.` };
   }
   if (notice.kind === 'KEY_EXPIRY') {
     return ru

@@ -1,6 +1,6 @@
 openapi: 3.1.0
 info:
-  title: ProxyKey API
+  title: Ksapi API
   version: 0.1.0
   description: |
     Store API and inference gateway for prepaid API keys. The selected package amount becomes the key's USDT balance. Pay in RUB through YooKassa or in USDT on TON through NOWPayments.
@@ -942,7 +942,7 @@ components:
     downstreamKey:
       type: http
       scheme: bearer
-      bearerFormat: ProxyKey
+      bearerFormat: Ksapi
     anthropicKey: { type: apiKey, in: header, name: x-api-key }
     geminiKey: { type: apiKey, in: header, name: x-goog-api-key }
   parameters:
@@ -1066,7 +1066,7 @@ components:
               keyHint: { type: string }
               providerName: { type: string }
               status: { type: string }
-              localRemainingUsd: { type: [string, 'null'], description: ProxyKey accounting; not a fresh provider confirmation. }
+              localRemainingUsd: { type: [string, 'null'], description: Ksapi accounting; not a fresh provider confirmation. }
               externalId: { type: [string, 'null'] }
               remoteStatus: { type: [string, 'null'] }
               remotePresent: { type: [boolean, 'null'] }

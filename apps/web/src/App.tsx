@@ -46,9 +46,9 @@ interface Order {
 }
 
 function Brand({ compact = false }: { compact?: boolean }) {
-  return <Link to="/" className="brand" aria-label="ProxyKey home">
+  return <Link to="/" className="brand" aria-label="Ksapi home">
     <span className="brand-mark"><Network size={18} /></span>
-    {!compact && <span>Proxy<span className="accent-text">Key</span></span>}
+    {!compact && <span>Ks<span className="accent-text">Api</span></span>}
   </Link>;
 }
 
@@ -90,7 +90,7 @@ function PublicFooter() {
   const { t, locale } = usePreferences();
   return <footer className="public-footer shell-width">
     <Brand />
-    <p>© {new Date().getFullYear()} ProxyKey</p>
+    <p>© {new Date().getFullYear()} Ksapi</p>
     <div><Link to="/docs">{t('docs')}</Link><a href="/openapi.yaml" target="_blank" rel="noreferrer">OpenAPI</a><a href="/health/serving" target="_blank" rel="noreferrer">{locale === 'ru' ? 'Статус API' : 'API status'}</a><Link to="/#faq">FAQ</Link></div>
   </footer>;
 }
@@ -107,7 +107,7 @@ function SetupPage() {
   return <div className="marketing-page"><PublicHeader/>
     <main className="shell-width setup-page">
       <div className="store-section-heading">
-        <div><h1>{ru ? 'Как подключить ProxyKey' : 'Connect to ProxyKey'}</h1><p>{ru ? 'Выберите клиент и подставьте ключ из кабинета.' : 'Choose a client and use the API key from your dashboard.'}</p></div>
+        <div><h1>{ru ? 'Как подключить Ksapi' : 'Connect to Ksapi'}</h1><p>{ru ? 'Выберите клиент и подставьте ключ из кабинета.' : 'Choose a client and use the API key from your dashboard.'}</p></div>
         <Link to="/docs">{ru ? 'Документация' : 'Documentation'} <ArrowRight size={17}/></Link>
       </div>
       <p className="store-muted">{ru ? 'Доступные для вашего ключа модели показаны в кабинете.' : 'Find the models available for your key in the dashboard.'}</p>
@@ -131,7 +131,7 @@ function ScrollToRoute() {
 
 const docsCopy = {
   ru: {
-    eyebrow: 'Документация ProxyKey',
+    eyebrow: 'Документация Ksapi',
     title: 'От покупки ключа до первого запроса',
     lead: 'Оплатите API-ключ один раз и используйте один баланс в Codex, Claude Code, OpenCode и других совместимых клиентах.',
     start: 'Начало работы', platform: 'API и оплата',
@@ -172,7 +172,7 @@ const docsCopy = {
     fullSpec: 'Открыть OpenAPI-спецификацию', buyNow: 'Купить ключ',
   },
   en: {
-    eyebrow: 'ProxyKey documentation',
+    eyebrow: 'Ksapi documentation',
     title: 'From buying a key to your first request',
     lead: 'Pay once for an API key and use one balance across Codex, Claude Code, OpenCode, and other compatible clients.',
     start: 'Getting started', platform: 'API and billing',
@@ -217,7 +217,7 @@ function DocsPage() {
   const { locale } = usePreferences();
   const copy = docsCopy[locale];
   const snippets = connectionSnippets(window.location.origin);
-  const authSnippet = `export PROXYKEY_API_KEY="${exampleKey}"`;
+  const authSnippet = `export KSAPI_API_KEY="${exampleKey}"`;
   const endpoints = [
     ['GET /v1/models', 'Каталог моделей ключа', 'Models available to the key'],
     ['POST /v1/responses', 'GPT и Grok · потоковые ответы', 'GPT and Grok · streaming'],
@@ -378,7 +378,7 @@ function DashboardOverview() {
   const active = keys.data?.keys.filter((key) => key.status === 'ACTIVE') ?? [];
   const remaining = active.reduce((sum, key) => sum + Math.max(0, Number(key.creditsTotal) - Number(key.creditsUsed)), 0);
   return <>
-    <PageTitle eyebrow="ProxyKey / API" title={t('overview')} action={<Link className="button" to="/dashboard/buy"><Plus size={17}/>{t('buyKey')}</Link>}/>
+    <PageTitle eyebrow="Ksapi / API" title={t('overview')} action={<Link className="button" to="/dashboard/buy"><Plus size={17}/>{t('buyKey')}</Link>}/>
     <div className="stat-grid">
       <StatCard icon={KeyRound} label={t('activeKeys')} value={keys.loading || keys.error ? '—' : String(active.length)} accent="violet"/>
       <StatCard icon={Wallet} label={t('remainingCredit')} value={keys.loading || keys.error ? '—' : money(remaining, locale, 'USDT', 4)} accent="green" detail={!keys.loading && !keys.error && <PriceCurrencies usdt={remaining} rates={exchange.data?.rates ?? null} loading={exchange.loading}/>}/>

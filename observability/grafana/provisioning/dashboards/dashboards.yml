@@ -1,8 +1,8 @@
 apiVersion: 1
 providers:
-  - name: ProxyKey
+  - name: Ksapi
     orgId: 1
-    folder: ProxyKey
+    folder: Ksapi
     type: file
     disableDeletion: true
     updateIntervalSeconds: 30
