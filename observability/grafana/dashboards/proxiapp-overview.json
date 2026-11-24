@@ -116,7 +116,7 @@
   "time": { "from": "now-6h", "to": "now" },
   "timepicker": {},
   "timezone": "browser",
-  "title": "ProxyKey / Service Overview",
+  "title": "Ksapi / Service Overview",
   "uid": "proxiapp-overview",
   "version": 1
 }

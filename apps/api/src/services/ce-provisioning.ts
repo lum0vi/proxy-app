@@ -135,7 +135,7 @@ async function eligiblePools(db: Connection, slugs: string[]) {
 async function prepareJob(db: Connection, pool: PricedPool, accountId: number, groupId: number): Promise<Job> {
   // Persist the label and secret before sending the create request. Recovery reuses both.
   const jobId = randomUUID();
-  const name = `proxykey-${pool.slug.slice(0, 38)}-${jobId}`;
+  const name = `ksapi-${pool.slug.slice(0, 38)}-${jobId}`;
   const key = `sk-${randomBytes(32).toString('hex')}`;
   const [job] = await db<Job[]>`
     INSERT INTO ce_key_provisioning_jobs (pool_id, id, name, account_id, group_id, quota, encrypted_key)

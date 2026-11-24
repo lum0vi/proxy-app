@@ -66,7 +66,7 @@ export function Storefront() {
           <div className="store-hero-benefits"><span><KeyRound size={16}/>{ru ? 'Разовая оплата' : 'One-time purchase'}</span><span><BarChart3 size={16}/>{ru ? 'Учёт по запросам' : 'Per-request usage'}</span></div>
         </div>
         <div className="store-hero-visual">
-          <img src="/proxykey-gateway.jpg" width="1280" height="960" alt="" fetchPriority="high"/>
+          <img src="/ksapi-gateway.jpg" width="1280" height="960" alt="" fetchPriority="high"/>
           <div className="store-api-panel"><span><i className={available ? 'ready' : ''}/>{catalog.loading ? (ru ? 'Проверяем доступ' : 'Checking access') : available ? (ru ? 'Ключи доступны' : 'Keys available') : (ru ? 'Покупка пока недоступна' : 'Purchases unavailable')}</span><code>POST /v1/responses</code></div>
         </div>
       </div>

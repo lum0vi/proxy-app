@@ -6,7 +6,7 @@ groups:
         for: 2m
         labels: { severity: critical }
         annotations:
-          summary: ProxyKey API is unavailable
+          summary: Ksapi API is unavailable
           description: Prometheus could not scrape the API for two minutes.
 
       - alert: PostgresDown

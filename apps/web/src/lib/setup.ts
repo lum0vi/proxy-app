@@ -57,23 +57,23 @@ export function connectionSnippets(origin: string, model = defaultModel, protoco
   };
   return {
     codex: `model = ${quotedModel}
-model_provider = "proxykey"
+model_provider = "ksapi"
 web_search = "disabled"
 
-[model_providers.proxykey]
-name = "ProxyKey"
+[model_providers.ksapi]
+name = "Ksapi"
 base_url = "${apiBase}"
-env_key = "PROXYKEY_API_KEY"
+env_key = "KSAPI_API_KEY"
 wire_api = "responses"
 supports_websockets = false`,
     curl: `curl -N "${url}" \\
-  -H "Authorization: Bearer $PROXYKEY_API_KEY" \\
+  -H "Authorization: Bearer $KSAPI_API_KEY" \\
   -H "Content-Type: application/json" \\
   ${anthropic ? '-H "anthropic-version: 2023-06-01" ' : ''}--data-binary '${request.replaceAll("'", "'\\''")}'`,
     node: `import OpenAI from "openai";
 
 const client = new OpenAI({
-  apiKey: process.env.PROXYKEY_API_KEY,
+  apiKey: process.env.KSAPI_API_KEY,
   baseURL: "${apiBase}",
 });
 
@@ -81,11 +81,11 @@ const response = await ${nodeRequest};`,
     claude: JSON.stringify({ env: claudeSettings }, null, 2),
     opencode: JSON.stringify({
       '$schema': 'https://opencode.ai/config.json',
-      model: `proxykey/${model}`,
+      model: `ksapi/${model}`,
       providers: {
-        proxykey: {
-          name: 'ProxyKey',
-          env: ['PROXYKEY_API_KEY'],
+        ksapi: {
+          name: 'Ksapi',
+          env: ['KSAPI_API_KEY'],
           package: packages[protocol],
           settings: { baseURL: protocol === 'GEMINI' ? origin + '/v1beta' : apiBase },
           models: { [model]: { name: model } },

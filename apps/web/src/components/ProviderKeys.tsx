@@ -64,7 +64,7 @@ export function ProviderKeys() {
         <td>{money(key.quotaUsedUsd, locale, 'USD', 4)} / {key.quotaUsd === null ? (ru ? 'Без лимита ключа' : 'No key limit') : money(key.quotaUsd, locale, 'USD')}</td>
         <td>{key.remainingUsd === null ? (ru ? 'Общий счёт / подписка' : 'Account / subscription') : money(key.remainingUsd, locale, 'USD', 4)}</td>
         <td>{key.customerKeys.map(customer => <div className="provider-key-customer" key={customer.keyId}><Link to={`/admin/users/${customer.userId}/keys`}>{customer.email}</Link><small>{customer.keyHint} · {money(customer.remainingUsdt, locale, 'USDT', 4)}</small></div>)}
-          {!key.customerKeys.length && (key.credentialId ? (ru ? 'Нет активных клиентских ключей' : 'No active customer keys') : (ru ? 'Не подключён к ProxyKey' : 'Not connected to ProxyKey'))}</td>
+          {!key.customerKeys.length && (key.credentialId ? (ru ? 'Нет активных клиентских ключей' : 'No active customer keys') : (ru ? 'Не подключён к Ksapi' : 'Not connected to Ksapi'))}</td>
       </tr>)}</tbody></table></div>
     {data && !data.keys.length && <p>{ru ? 'Ключей по этому фильтру пока нет.' : 'No keys match this filter.'}</p>}
     <Pages page={page} total={data?.total ?? 0} size={data?.pageSize ?? 25} busy={remote.loading} change={setPage}/>
@@ -104,7 +104,7 @@ export function AdminUserKeys() {
             <small>{upstream.externalId ? `CE #${upstream.externalId} · ${upstream.remotePresent ? upstream.remoteStatus : ru ? 'нет в аккаунте' : 'no longer listed'}` : upstream.status}</small>
             {upstream.externalId ? <small>{ru ? 'Остаток CE: ' : 'CE remaining: '}{upstream.remoteRemainingUsd === null ? (ru ? 'нет индивидуального лимита' : 'no individual limit') : money(upstream.remoteRemainingUsd, locale, 'USD', 4)}
               {upstream.remoteStale && (ru ? ' · устаревшие данные' : ' · stale data')}{upstream.remoteCheckedAt && ` · ${new Date(upstream.remoteCheckedAt).toLocaleString(locale)}`}</small>
-              : <small>{ru ? 'По учёту ProxyKey: ' : 'ProxyKey accounting: '}{upstream.localRemainingUsd === null ? (ru ? 'лимит не задан' : 'no limit set') : money(upstream.localRemainingUsd, locale, 'USD', 4)}</small>}
+              : <small>{ru ? 'По учёту Ksapi: ' : 'Ksapi accounting: '}{upstream.localRemainingUsd === null ? (ru ? 'лимит не задан' : 'no limit set') : money(upstream.localRemainingUsd, locale, 'USD', 4)}</small>}
             <small>{ru ? 'Активных клиентских ключей на этом ключе провайдера: ' : 'Active customer keys sharing this provider key: '}{upstream.sharedKeyCount}</small>
           </div>)}</td>
         </tr>)}</tbody></table></div>
