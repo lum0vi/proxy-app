@@ -316,20 +316,22 @@ integration('RUB checkout and USDT ledger with HTTP payment providers', () => {
     } finally { clock.mockRestore(); }
   });
 
-  it('advertises only USDT and rejects RUB before reserving stock when rubles are disabled', async () => {
+  it('shows the RUB equivalent but rejects RUB checkout before reserving stock when rubles are disabled', async () => {
     const original = [...config.paymentCurrencies];
+    const originalRate = config.USDT_RUB_RATE;
+    Object.assign(config, { USDT_RUB_RATE: '90' });
     config.paymentCurrencies.splice(0, config.paymentCurrencies.length, 'USDT');
     const before = await sql`SELECT id FROM orders WHERE user_id = ${userId} ORDER BY id`;
     try {
       expect((await app.inject('/api/config')).json().paymentCurrencies).toEqual(['USDT']);
       expect((await app.inject('/api/products')).json().paymentCurrencies).toEqual(['USDT']);
-      expect((await app.inject('/api/price-rates')).json()).toEqual({ rates: null });
+      expect((await app.inject('/api/price-rates')).json().rates).toMatchObject({ usdtToRub: '90.00000000', source: 'configured' });
       const response = await app.inject({ method: 'POST', url: '/api/orders', headers: sessionHeaders,
         payload: { productId, paymentProvider: 'mock', paymentCurrency: 'RUB' } });
       expect(response.statusCode).toBe(400);
       expect(response.json().error.code).toBe('PAYMENT_CURRENCY_DISABLED');
       expect(await sql`SELECT id FROM orders WHERE user_id = ${userId} ORDER BY id`).toEqual(before);
-    } finally { config.paymentCurrencies.splice(0, config.paymentCurrencies.length, ...original); }
+    } finally { config.paymentCurrencies.splice(0, config.paymentCurrencies.length, ...original); Object.assign(config, { USDT_RUB_RATE: originalRate }); }
   });
 
   it('blocks keys originally paid with the YooKassa test shop in production', async () => {

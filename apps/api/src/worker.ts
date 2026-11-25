@@ -7,6 +7,8 @@ import { ceBalanceProvider, processProviderBalanceAlerts, recordProviderBalanceF
 import { processNotifications } from './services/notifications.js';
 import { retryPaidOrders } from './services/orders.js';
 import { refreshUpstreamCatalog } from './services/upstream-catalog.js';
+import { scanTonPayments } from './services/ton-payments.js';
+import { processVideoJobs } from './proxy/videos.js';
 
 let stopping = false;
 const shutdown = new AbortController();
@@ -50,6 +52,9 @@ async function main(): Promise<void> {
   while (!stopping) {
     try {
       await housekeeping();
+      // Customer payments must keep being checked even when a provider's API is down.
+      await scanTonPayments();
+      await processVideoJobs();
       if (config.ceKeySyncEnabled && (Date.now() >= nextKeySync || await providerKeyRefreshRequested())) {
         try { await syncCeKeys(ceLogin()); }
         catch { await recordProviderKeyFailure('CE_KEY_SYNC_FAILED_OR_LOGIN_MISSING'); }

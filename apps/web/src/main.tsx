@@ -6,6 +6,7 @@ import { AuthProvider } from './lib/auth';
 import { PreferencesProvider } from './lib/preferences';
 import './styles.css';
 import './storefront.css';
+import './components/api-showcase.css';
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

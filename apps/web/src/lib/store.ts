@@ -1,10 +1,11 @@
 import type { Locale } from './preferences';
 
-export type Protocol = 'OPENAI' | 'OPENAI_CHAT' | 'ANTHROPIC' | 'GEMINI' | 'IMAGES';
+export type Protocol = 'OPENAI' | 'OPENAI_CHAT' | 'ANTHROPIC' | 'GEMINI' | 'IMAGES' | 'VIDEOS';
 
 export interface ModelOption {
   model: string;
   protocol: Protocol;
+  mediaOptions?: Record<string, (string | number | boolean)[]>;
 }
 
 export interface ModelRate extends ModelOption {
@@ -13,6 +14,8 @@ export interface ModelRate extends ModelOption {
   cachedInputPerMillion: string;
   outputPerMillion: string;
   perRequest: string;
+  perSecond: string;
+  mediaOptions: Record<string, (string | number | boolean)[]>;
   longContextThreshold: number | null;
   longContextMultiplier: string;
   peakMultiplier: string;
@@ -33,7 +36,7 @@ export interface Product {
   unpricedModels: ModelOption[];
 }
 
-export type PaymentMethod = 'yookassa' | 'nowpayments' | 'mock';
+export type PaymentMethod = 'yookassa' | 'nowpayments' | 'ton' | 'mock';
 export type PaymentCurrency = 'RUB' | 'USDT';
 
 export interface StoreCatalog {
@@ -58,6 +61,7 @@ export interface CustomerKey {
   status: string;
   creditsTotal: string;
   creditsUsed: string;
+  reservedCredits: string;
   currency: 'USDT';
   concurrencyLimit: number;
   expiresAt: string | null;

@@ -8,6 +8,8 @@
 .public-header .brand { flex-shrink: 0; }
 .public-header .header-actions { flex-shrink: 0; }
 .public-header .brand-mark { border-radius: 8px; }
+.public-footer { flex-wrap: wrap; padding-block: 26px; }
+.public-footer > div { flex-wrap: wrap; row-gap: 12px; }
 .store-hero {
   --hero-accent: #8be7b8;
   position: relative;
@@ -88,6 +90,41 @@
 .store-section-heading p { margin: 12px 0 0; color: var(--text-soft); line-height: 1.65; font-size: 15px; }
 .store-section-heading > a, .store-faq > div:last-child > a { display: inline-flex; align-items: center; gap: 8px; color: var(--primary-strong); font-size: 14px; font-weight: 700; }
 .store-section-heading > a:hover, .store-faq > div:last-child > a:hover { text-decoration: underline; text-underline-offset: 4px; }
+
+.comparison-eyebrow { display: inline-flex; align-items: center; gap: 8px; color: var(--primary-strong); font: 600 11px/1.5 'IBM Plex Mono', monospace; letter-spacing: .1em; margin-bottom: 14px; }
+.comparison-benefits { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-bottom: 28px; }
+.comparison-benefits article { min-width: 0; padding: 24px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--bg-elevated); }
+.comparison-icon { display: inline-flex; padding: 11px; border-radius: 12px; color: var(--primary-strong); background: var(--bg-soft); }
+.comparison-benefits h3 { margin: 19px 0 10px; font-size: 19px; letter-spacing: -.025em; }
+.comparison-benefits p { margin: 0; color: var(--text-soft); font-size: 14px; line-height: 1.7; }
+.comparison-table-wrap { border: 1px solid var(--line); border-radius: var(--radius); overflow-x: auto; background: var(--bg-elevated); }
+.comparison-table { width: 100%; min-width: 630px; border-collapse: collapse; table-layout: fixed; }
+.comparison-table th, .comparison-table td { padding: 20px 24px; text-align: left; vertical-align: top; white-space: normal; overflow-wrap: anywhere; border-bottom: 1px solid var(--line); font-size: 14px; line-height: 1.65; }
+.comparison-table thead th { background: var(--bg-soft); font-weight: 650; text-transform: none; letter-spacing: normal; }
+.comparison-table thead th:first-child { width: 22%; font-size: 13px; }
+.comparison-table thead th > span { display: block; color: var(--text); font-size: 21px; }
+.comparison-table thead small { display: block; color: var(--text-soft); font-size: 12px; margin-top: 3px; font-weight: 400; }
+.comparison-table tr > :nth-child(2) { background: color-mix(in srgb, var(--primary) 10%, var(--bg-elevated)); }
+.comparison-table tbody th { color: var(--text); font-weight: 600; text-transform: none; letter-spacing: normal; }
+.comparison-table tbody td { color: var(--text-soft); }
+.comparison-table tbody td:first-of-type { color: var(--text); }
+.comparison-table tbody tr:last-child > * { border-bottom: 0; }
+.comparison-bottom { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin-top: 22px; }
+.comparison-bottom p { max-width: 760px; margin: 0; color: var(--text-soft); font-size: 13px; line-height: 1.7; }
+.comparison-bottom .button { flex-shrink: 0; }
+.comparison-sources { color: var(--text-soft); font-size: 12px; line-height: 1.65; margin: 18px 0 0; }
+.comparison-sources a { color: var(--primary-strong); text-decoration: underline; text-underline-offset: 3px; }
+.store-support { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(245px, 1fr); align-items: center; gap: 35px; padding: 40px; border: 1px solid var(--line-strong); border-radius: 24px; background: radial-gradient(ellipse at top right, color-mix(in srgb, var(--primary) 15%, transparent), transparent 65%), var(--bg-elevated); }
+.store-support h2 { margin: 0; font-size: clamp(29px, 4vw, 46px); letter-spacing: -.045em; }
+.support-copy > p { color: var(--text-soft); line-height: 1.7; margin: 17px 0 12px; }
+.support-copy > small { color: var(--text-soft); font-size: 12px; line-height: 1.7; display: block; }
+.support-contact { display: flex; align-items: center; gap: 17px; min-width: 0; padding: 23px; border: 1px solid var(--line-strong); border-radius: 18px; background: var(--bg-soft); transition: border-color .15s, background .15s; }
+.support-contact:hover { border-color: var(--primary-strong); background: color-mix(in srgb, var(--primary) 15%, var(--bg-elevated)); }
+.support-contact > svg { flex-shrink: 0; color: var(--primary-strong); }
+.support-contact > svg:last-child { margin-left: auto; }
+.support-contact > span { display: grid; gap: 5px; }
+.support-contact strong { font-size: 25px; letter-spacing: -.035em; }
+.support-contact small, .support-contact span span { color: var(--text-soft); font-size: 12px; }
 .store-packages { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 285px), 1fr)); gap: 16px; }
 .store-package { display: flex; flex-direction: column; min-width: 0; padding: 24px; border: 1px solid var(--line); border-radius: 14px; background: var(--bg-elevated); }
 .store-package.featured { border-color: color-mix(in srgb, var(--primary-strong) 62%, var(--line)); background: color-mix(in srgb, var(--primary) 8%, var(--bg-elevated)); }
@@ -177,6 +214,11 @@
   .store-api-panel { inset: auto 0 -20px auto; }
   .store-section { padding-block: 55px; }
   .store-faq { grid-template-columns: 1fr; gap: 0; }
+  .comparison-benefits { gap: 10px; }
+  .comparison-benefits article { padding: 18px; }
+  .comparison-bottom { align-items: flex-start; flex-direction: column; gap: 15px; }
+  .store-support { padding: 26px; gap: 22px; grid-template-columns: 1fr; }
+  .support-contact { max-width: 390px; }
 }
 @media (max-width: 640px) {
   .marketing-page .public-header { min-height: 65px; gap: 8px; }
@@ -197,6 +239,11 @@
   .client-pickers { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .client-preferences { grid-template-columns: 1fr; }
   .setup-page { padding-block: 40px 50px; }
+  .comparison-benefits { grid-template-columns: 1fr; }
+  .comparison-benefits h3 { margin-top: 13px; }
+  .comparison-table th, .comparison-table td { padding: 14px 16px; }
+  .store-support { padding: 22px; }
+  .support-contact { padding: 18px; }
 }
 @media (max-width: 360px) {
   .marketing-page .public-header .brand { font-size: 16px; gap: 6px; }

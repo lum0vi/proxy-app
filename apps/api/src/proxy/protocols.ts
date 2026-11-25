@@ -1,4 +1,4 @@
-export const protocols = ['OPENAI', 'OPENAI_CHAT', 'ANTHROPIC', 'GEMINI', 'IMAGES'] as const;
+export const protocols = ['OPENAI', 'OPENAI_CHAT', 'ANTHROPIC', 'GEMINI', 'IMAGES', 'VIDEOS'] as const;
 export type Protocol = (typeof protocols)[number];
 
 export const inferenceProtocols: Record<string, Protocol[]> = {
@@ -6,9 +6,13 @@ export const inferenceProtocols: Record<string, Protocol[]> = {
   '/v1/responses/compact': ['OPENAI'],
   '/v1/chat/completions': ['OPENAI', 'OPENAI_CHAT'],
   '/v1/images/generations': ['IMAGES', 'OPENAI'],
+  '/v1/images/edits': ['IMAGES'],
+  '/v1/videos': ['VIDEOS'],
   '/v1/messages': ['ANTHROPIC'],
+  '/v1/messages/count_tokens': ['ANTHROPIC'],
   '/v1beta/generateContent': ['GEMINI'],
   '/v1beta/streamGenerateContent': ['GEMINI'],
+  '/v1beta/countTokens': ['GEMINI'],
 };
 
 export function catalogHeaders(protocol: Protocol, secret: string): Headers {
@@ -23,14 +27,14 @@ export function catalogHeaders(protocol: Protocol, secret: string): Headers {
 }
 
 export function nativeError(path: string, status: number, code: string, message: string) {
-  if (path.split('?', 1)[0] === '/v1/messages') {
+  if (path.split('?', 1)[0]?.startsWith('/v1/messages')) {
     const type = status === 429 ? 'rate_limit_error' : status === 401 ? 'authentication_error'
       : status === 403 ? 'permission_error' : status === 404 ? 'not_found_error'
       : status === 413 ? 'request_too_large' : status === 529 ? 'overloaded_error'
       : status >= 500 ? 'api_error' : 'invalid_request_error';
     return { type: 'error', error: { type, message }, code };
   }
-  if (path.startsWith('/v1beta/')) {
+  if (path.startsWith('/v1beta/') || /^\/v1\/models\/[^/]+:/.test(path)) {
     const reason = status === 401 ? 'UNAUTHENTICATED' : status === 402 || status === 429 ? 'RESOURCE_EXHAUSTED'
       : status === 403 ? 'PERMISSION_DENIED' : status === 404 ? 'NOT_FOUND'
       : status === 504 ? 'DEADLINE_EXCEEDED' : status >= 500 ? 'UNAVAILABLE' : 'INVALID_ARGUMENT';

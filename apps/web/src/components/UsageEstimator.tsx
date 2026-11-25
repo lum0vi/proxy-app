@@ -14,7 +14,8 @@ interface Estimate {
 }
 
 function family(model: string, protocol: string) {
-  if (protocol === 'IMAGES') return 'GPT Image';
+  if (protocol === 'IMAGES') return 'Images';
+  if (protocol === 'VIDEOS') return 'Videos';
   if (protocol === 'GEMINI') return 'Gemini';
   if (model.startsWith('claude-')) return 'Claude';
   if (model.startsWith('grok-')) return 'Grok';
@@ -35,19 +36,23 @@ export function UsageEstimator({ products, exchange }: { products: Product[]; ex
   const [selectedModel, setSelectedModel] = useState('');
   const [tokens, setTokens] = useState({ input: '12000', cached: '4000', output: '1500', write5m: '0', write1h: '0' });
   const [imageCount, setImageCount] = useState('1');
+  const [videoDuration, setVideoDuration] = useState('');
   const [quote, setQuote] = useState<{ url: string; value?: Estimate }>({ url: '' });
   const [attempt, setAttempt] = useState(0);
   const product = products.find(({ id }) => id === selectedProduct) ?? products[0];
   const models = product?.models ?? [];
   const model = models.find(({ model }) => model === selectedModel) ?? models.find(({ model }) => model === defaultModel) ?? models[0];
   const images = model?.protocol === 'IMAGES';
+  const videos = model?.protocol === 'VIDEOS';
+  const durations = model?.mediaOptions?.seconds?.filter((value): value is number => typeof value === 'number') ?? [];
+  const videoSeconds = durations.includes(Number(videoDuration)) ? videoDuration : String(durations[0] ?? '');
   const anthropic = model?.protocol === 'ANTHROPIC';
   const write5m = anthropic ? tokens.write5m : '0';
   const write1h = anthropic ? tokens.write1h : '0';
   const input = Number(tokens.input), cached = Number(tokens.cached), output = Number(tokens.output);
-  const valid = images ? /^([1-9]|10)$/.test(imageCount) : [tokens.input, tokens.cached, tokens.output, write5m, write1h].every((value) => /^\d+$/.test(value))
+  const valid = videos ? durations.includes(Number(videoSeconds)) : images ? /^([1-9]|10)$/.test(imageCount) : [tokens.input, tokens.cached, tokens.output, write5m, write1h].every((value) => /^\d+$/.test(value))
     && input + output > 0 && input <= 1_100_000 && cached + Number(write5m) + Number(write1h) <= input && output <= 128_000;
-  const query = new URLSearchParams(images ? { model: model.model, inputTokens: '0', outputTokens: '0', imageCount }
+  const query = new URLSearchParams(videos ? { model: model.model, inputTokens: '0', outputTokens: '0', videoSeconds } : images ? { model: model.model, inputTokens: '0', outputTokens: '0', imageCount }
     : { model: model?.model ?? '', inputTokens: tokens.input, cachedInputTokens: tokens.cached, outputTokens: tokens.output, cacheWrite5mTokens: write5m, cacheWrite1hTokens: write1h });
   const url = valid && model && product ? `/api/products/${product.id}/estimate?${query}` : '';
 
@@ -83,7 +88,8 @@ export function UsageEstimator({ products, exchange }: { products: Product[]; ex
           {families.map((name) => <optgroup key={name} label={name}>{models.filter((item) => family(item.model, item.protocol) === name).map((item) => <option key={item.model}>{item.model}</option>)}</optgroup>)}
         </select></label>
       </div>
-      {images ? <label className="field estimate-presets"><span>{ru ? 'Изображений за запрос' : 'Images per request'}</span><input type="number" min={1} max={10} value={imageCount} onChange={(event) => setImageCount(event.target.value)}/></label> : <>
+      {videos ? <label className="field estimate-presets"><span>{ru ? 'Длительность видео, секунд' : 'Video duration, seconds'}</span><select value={videoSeconds} onChange={event => setVideoDuration(event.target.value)}>{durations.map(value => <option key={value}>{value}</option>)}</select></label>
+      : images ? <label className="field estimate-presets"><span>{ru ? 'Изображений за запрос' : 'Images per request'}</span><input type="number" min={1} max={10} value={imageCount} onChange={(event) => setImageCount(event.target.value)}/></label> : <>
       <div className="estimate-presets" aria-label={ru ? 'Примеры запросов' : 'Request examples'}>
         {examples.map((preset) => <button type="button" key={preset.input}
           aria-pressed={input === preset.input && cached === preset.cached && output === preset.output}
@@ -141,11 +147,11 @@ export function ModelCatalog({ products, exchange }: { products: Product[]; exch
       </div>}
       {displayCurrency === 'RUB' && <p className="form-hint">{ru ? 'Справочный эквивалент по текущему курсу. Списание с баланса — в USDT.' : 'Indicative equivalent at the current exchange rate. Usage is charged in USDT.'}</p>}
       <div className="table-scroll"><table>
-        <thead><tr>{[ru ? 'Модель' : 'Model', ru ? 'Вход' : 'Input', ru ? 'Кэш' : 'Cache', ru ? 'Ответ' : 'Output', ru ? 'За запрос' : 'Per request', ru ? 'Доступ' : 'Access'].map((label) => <th key={label}>{label}</th>)}</tr></thead>
+        <thead><tr>{[ru ? 'Модель' : 'Model', ru ? 'Вход' : 'Input', ru ? 'Кэш' : 'Cache', ru ? 'Ответ' : 'Output', ru ? 'Изображения / видео' : 'Images / video', ru ? 'Доступ' : 'Access'].map((label) => <th key={label}>{label}</th>)}</tr></thead>
         <tbody>{rates.map((rate) => <tr key={rate.model}>
-          <td><code>{rate.model}</code>{rate.longContextThreshold && <small className="catalog-status">{Number(rate.longContextMultiplier)}× &gt; {new Intl.NumberFormat(locale).format(rate.longContextThreshold)}</small>}{Number(rate.peakMultiplier) > 1 && <small className="catalog-status">{Number(rate.peakMultiplier)}× {ru ? 'в часы пик' : 'at peak times'}</small>}</td>
-          {[rate.inputPerMillion, rate.cachedInputPerMillion, rate.outputPerMillion].map((value, index) => <td key={index}>{rate.protocol === 'IMAGES' ? '—' : ratePrice(value)}</td>)}
-          <td>{Number(rate.perRequest) > 0 ? ratePrice(rate.perRequest) : '—'}</td>
+          <td><code>{rate.model}</code>{Object.keys(rate.mediaOptions ?? {}).length > 0 && <small className="catalog-status">{Object.entries(rate.mediaOptions).map(([key, values]) => `${key}: ${values.join(", ")}`).join(" · ")}</small>}{rate.longContextThreshold && <small className="catalog-status">{Number(rate.longContextMultiplier)}× &gt; {new Intl.NumberFormat(locale).format(rate.longContextThreshold)}</small>}{Number(rate.peakMultiplier) > 1 && <small className="catalog-status">{Number(rate.peakMultiplier)}× {ru ? 'в часы пик' : 'at peak times'}</small>}</td>
+          {[rate.inputPerMillion, rate.cachedInputPerMillion, rate.outputPerMillion].map((value, index) => <td key={index}>{['IMAGES', 'VIDEOS'].includes(rate.protocol) ? '—' : ratePrice(value)}</td>)}
+          <td>{Number(rate.perSecond) > 0 ? `${ratePrice(rate.perSecond)} / ${ru ? 'с' : 's'}` : Number(rate.perRequest) > 0 ? `${ratePrice(rate.perRequest)} / ${ru ? 'изобр.' : 'image'}` : '—'}</td>
           <td><span className={`catalog-status${rate.available ? ' available' : ''}`}>{rate.available ? (ru ? 'Доступна' : 'Available') : (ru ? 'Недоступна' : 'Unavailable')}</span></td>
         </tr>)}{product.unpricedModels.filter(visible).map((rate) => <tr key={rate.model}>
           <td><code>{rate.model}</code></td><td colSpan={4}>—</td><td><span className="catalog-status">{ru ? 'Ставка не задана' : 'Rate pending'}</span></td>

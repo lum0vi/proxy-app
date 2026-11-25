@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { Decimal } from 'decimal.js';
 import { z } from 'zod';
+import { tonHash } from '../lib/ton.js';
 import { requireAuth } from '../auth/session.js';
 import { config } from '../config.js';
 import { sql } from '../db/index.js';
@@ -14,7 +15,7 @@ import type { AuthenticatedRequest } from '../types.js';
 
 const createOrderSchema = z.object({
   productId: z.string().uuid(),
-  paymentProvider: z.enum(['yookassa', 'nowpayments', 'mock']),
+  paymentProvider: z.enum(['yookassa', 'nowpayments', 'ton', 'mock']),
   paymentCurrency: z.enum(['RUB', 'USDT']).optional(),
   topUpKeyId: z.string().uuid().optional(),
 });
@@ -25,6 +26,7 @@ const estimateSchema = z.object({
   model: z.string().min(1).max(200),
   inputTokens: z.coerce.number().int().min(0).max(1_100_000).default(0),
   imageCount: z.coerce.number().int().min(1).max(10).optional(),
+  videoSeconds: z.coerce.number().int().min(1).max(120).optional(),
   cachedInputTokens: z.coerce.number().int().min(0).max(1_000_000).default(0),
   cacheWrite5mTokens: z.coerce.number().int().min(0).max(1_000_000).default(0),
   cacheWrite1hTokens: z.coerce.number().int().min(0).max(1_000_000).default(0),
@@ -46,6 +48,8 @@ interface EstimateRate {
   cachedInputPerMillion: string;
   outputPerMillion: string;
   perRequest: string;
+  perSecond: string;
+  mediaOptions: Record<string, (string | number | boolean)[]>;
   longContextThreshold: number | null;
   longContextMultiplier: string;
 }
@@ -65,6 +69,7 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
             'model', r.model, 'available', r.available, 'protocol', r.protocol,
             'inputPerMillion', r.input_per_million::text, 'cachedInputPerMillion', r.cached_input_per_million::text,
             'outputPerMillion', r.output_per_million::text, 'perRequest', r.per_request::text,
+            'perSecond', r.per_second::text, 'mediaOptions', r.media_options,
             'longContextThreshold', r.long_context_threshold, 'longContextMultiplier', r.long_context_multiplier::text,
             'peakMultiplier', r.peak_multiplier::text
           ) ORDER BY r.model)
@@ -92,39 +97,43 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
             cachedInputPerMillion: moneyString(new Decimal(rate.cachedInputPerMillion).mul(factor), 12),
             outputPerMillion: moneyString(new Decimal(rate.outputPerMillion).mul(factor), 12),
             perRequest: moneyString(new Decimal(rate.perRequest).mul(factor), 12),
+            perSecond: moneyString(new Decimal(rate.perSecond).mul(factor), 12),
           })),
         };
       }),
       paymentMethods: config.salesEnabled ? config.paymentMethods : [],
       paymentCurrencies: config.salesEnabled ? config.paymentCurrencies : [],
-      cryptoCurrency: config.paymentMethods.includes('nowpayments') && config.salesEnabled ? 'USDT' : null,
-      cryptoNetwork: config.paymentMethods.includes('nowpayments') && config.salesEnabled ? 'TON' : null,
+      cryptoCurrency: config.paymentMethods.some(method => ['nowpayments', 'ton'].includes(method)) && config.salesEnabled ? 'USDT' : null,
+      cryptoNetwork: config.paymentMethods.some(method => ['nowpayments', 'ton'].includes(method)) && config.salesEnabled ? 'TON' : null,
       currency: 'USDT',
     };
   });
 
-  app.get('/api/price-rates', async () => ({ rates: config.paymentCurrencies.includes('RUB') ? await getPriceRates() : null }));
+  app.get('/api/price-rates', async () => ({ rates: await getPriceRates() }));
 
   app.get('/api/products/:id/estimate', async (request) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
     const usage = estimateSchema.parse(request.query);
     const [rate] = await sql<EstimateRate[]>`
       SELECT p.wholesale_credits::text, r.protocol, r.input_per_million::text, r.cached_input_per_million::text,
-        r.output_per_million::text, r.per_request::text, r.long_context_threshold, r.long_context_multiplier::text, r.peak_multiplier::text
+        r.output_per_million::text, r.per_request::text, r.per_second::text, r.media_options, r.long_context_threshold, r.long_context_multiplier::text, r.peak_multiplier::text
       FROM products p JOIN public_pool_models r ON r.root_pool_id = p.pool_id
       WHERE p.id = ${id} AND p.active AND r.model = ${usage.model}
     `;
     const terms = assertFound(rate, 'PRODUCT_RATE_NOT_FOUND', 'This model has no public rate for the package');
     const imageCount = usage.imageCount ?? (terms.protocol === 'IMAGES' ? 1 : 0);
-    if ((terms.protocol === 'IMAGES' ? new Decimal(terms.perRequest).lte(0) || usage.inputTokens + usage.outputTokens > 0
-      : imageCount !== 0 || usage.inputTokens + usage.outputTokens === 0)
+    const videoSeconds = usage.videoSeconds ?? 0;
+    if ((terms.protocol === 'VIDEOS' ? new Decimal(terms.perSecond).lte(0) || !terms.mediaOptions.seconds?.includes(videoSeconds)
+        || imageCount !== 0 || usage.inputTokens + usage.outputTokens > 0
+      : terms.protocol === 'IMAGES' ? new Decimal(terms.perRequest).lte(0) || usage.inputTokens + usage.outputTokens > 0 || videoSeconds > 0
+      : imageCount !== 0 || videoSeconds > 0 || usage.inputTokens + usage.outputTokens === 0)
       || (terms.protocol !== 'ANTHROPIC' && usage.cacheWrite5mTokens + usage.cacheWrite1hTokens > 0)) {
       throw new AppError(400, 'INVALID_ESTIMATE', 'Enter usage for the selected model');
     }
     const price = retailPrice(terms.wholesaleCredits);
     const peak = activePeakMultiplier(terms.peakMultiplier);
     const cost = retailUsageCost(calculateUsageCost({
-      ...usage, ...terms, peakMultiplier: peak, imageCount,
+      ...usage, ...terms, peakMultiplier: peak, imageCount, videoSeconds,
       inputTokens: imageCount ? 0 : usage.inputTokens, outputTokens: imageCount ? 0 : usage.outputTokens,
     }), retailMultiplier(price, terms.wholesaleCredits));
     return {
@@ -175,6 +184,21 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
     return { order: assertFound(order, 'ORDER_NOT_FOUND', 'Order not found') };
   });
 
+  app.post('/api/orders/:id/payment-claim', { preHandler: requireAuth }, async request => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const { transactionHash } = z.object({ transactionHash: z.string().trim().min(43).max(64) }).parse(request.body);
+    let hash: string;
+    try { hash = tonHash(transactionHash); } catch { throw new AppError(400, 'INVALID_TRANSACTION_HASH', 'Enter a TON transaction hash'); }
+    const userId = (request as AuthenticatedRequest).authUser.id;
+    // A public hash is not proof that the submitter owns a payment. This only opens a review request.
+    const [order] = await sql`UPDATE orders SET metadata = metadata || ${sql.json({
+      paymentClaim: { transactionHash: hash, submittedAt: new Date().toISOString() },
+    })}, updated_at = now() WHERE id = ${id} AND user_id = ${userId} AND payment_provider = 'ton'
+      AND status NOT IN ('PAID', 'FULFILLED', 'REFUNDED') RETURNING id`;
+    assertFound(order, 'ORDER_NOT_FOUND', 'Unpaid TON order not found');
+    return { submitted: true };
+  });
+
   app.post('/api/payments/mock/:orderId/complete', { preHandler: requireAuth }, async (request) => {
     if (!config.ALLOW_MOCK_PAYMENTS || config.NODE_ENV === 'production') {
       throw new AppError(404, 'NOT_FOUND', 'Not found');
@@ -199,6 +223,7 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
     const userId = (request as AuthenticatedRequest).authUser.id;
     const keys = await sql<Record<string, unknown>[]>`
       SELECT ak.id, ak.label, ak.key_hint, ak.status, ak.credits_total::text, ak.credits_used::text, ak.currency,
+        COALESCE((SELECT sum(l.retail_reserved_cost) FROM request_leases l WHERE l.api_key_id = ak.id AND l.expires_at > now()), 0)::text AS reserved_credits,
         ak.concurrency_limit, ak.expires_at, ak.last_used_at, ak.created_at, o.payment_provider = 'mock' AS test_key,
         ARRAY(
           SELECT p.id FROM products p JOIN upstream_pools up ON up.id = p.pool_id
@@ -206,8 +231,9 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
             AND ak.status IN ('ACTIVE', 'EXHAUSTED') AND ak.expires_at IS NULL
         ) AS top_up_product_ids,
         ARRAY(SELECT DISTINCT m.model FROM usable_key_models m WHERE m.api_key_id = ak.id ORDER BY m.model) AS models,
-        COALESCE((SELECT jsonb_agg(jsonb_build_object('model', m.model, 'protocol', m.protocol) ORDER BY m.model, m.protocol)
-          FROM usable_key_models m WHERE m.api_key_id = ak.id), '[]'::jsonb) AS model_options
+        COALESCE((SELECT jsonb_agg(jsonb_build_object('model', m.model, 'protocol', m.protocol, 'mediaOptions', r.media_options) ORDER BY m.model, m.protocol)
+          FROM usable_key_models m JOIN public_pool_models r ON r.root_pool_id = o.pool_id AND r.model = m.model AND r.protocol = m.protocol
+          WHERE m.api_key_id = ak.id), '[]'::jsonb) AS model_options
       FROM api_keys ak JOIN orders o ON o.id = ak.order_id
       WHERE ak.user_id = ${userId}
       ORDER BY ak.created_at DESC
@@ -225,7 +251,7 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
     const rows = await sql<({ id: string } & Record<string, unknown>)[]>`
       SELECT id, request_id, endpoint, model, input_tokens::text, output_tokens::text, cached_input_tokens::text,
         cache_write_5m_tokens::text, cache_write_1h_tokens::text,
-        image_count, retail_cost::text AS cost, status, http_status, error_code, started_at, completed_at
+        image_count, video_seconds, retail_cost::text AS cost, status, http_status, error_code, started_at, completed_at
       FROM usage_records WHERE api_key_id = ${id}
       ${before ? sql`AND (started_at, id) < (SELECT started_at, id FROM usage_records WHERE id = ${before} AND api_key_id = ${id})` : sql``}
       ORDER BY started_at DESC, id DESC LIMIT ${limit + 1}

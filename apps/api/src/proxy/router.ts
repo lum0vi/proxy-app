@@ -1,177 +1,31 @@
 import { once } from 'node:events';
-import { randomUUID } from 'node:crypto';
-import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
-import type postgres from 'postgres';
-import { Decimal } from 'decimal.js';
+import type { FastifyInstance, FastifyReply } from 'fastify';
 import { config } from '../config.js';
 import { sql } from '../db/index.js';
-import { decryptSecret, sha256 } from '../lib/crypto.js';
+import { decryptSecret } from '../lib/crypto.js';
 import { AppError } from '../lib/errors.js';
-import {
-  activeProxyRequests, proxyAccountingAnomalies, proxyDuration, proxyRequests, usageCost, upstreamTimeToFirstByte,
-} from '../observability/metrics.js';
-import { selectCredentialWithCapacity } from '../services/capacity.js';
-import { activePeakMultiplier, calculateUsageCost, retailMultiplier, retailUsageCost } from '../services/pricing.js';
+import { activeProxyRequests, proxyAccountingAnomalies, proxyDuration, proxyRequests, upstreamTimeToFirstByte } from '../observability/metrics.js';
 import { enabledEndpoint, nativeHeaders, prepareInference, upstreamHeaders } from './request.js';
-import { inferenceProtocols, type Protocol } from './protocols.js';
+import type { Protocol } from './protocols.js';
 import { PublicEventStream } from './public-stream.js';
-import { StreamUsageTracker, extractUsage, type Usage } from './usage.js';
+import { StreamUsageTracker, extractUsage } from './usage.js';
+import { acquireLease, emptyUsage, finalizeUsage, keyHash, resolveKey, unavailable, type CredentialContext } from './accounting.js';
+import { prepareMedia } from './media.js';
+import { videoRoutes } from './videos.js';
 
-interface KeyContext {
-  id: string;
-  status: string;
-  creditsTotal: string;
-  creditsUsed: string;
-  concurrencyLimit: number;
-  expiresAt: Date | null;
-  upstreamCredentialId: string;
-  primaryPoolId: string;
-  poolId: string;
-  amount: string;
-  paymentProvider: string;
-  testPayment: boolean;
-  wholesaleCredits: string;
-  userStatus: string;
-  poolActive: boolean;
-}
-
-interface CredentialContext {
-  id: string;
-  encryptedKey: string;
-  maxConcurrency: number;
-  providerSlug: string;
-  baseUrl: string;
-  spendLimit: string | null;
-  spendUsed: string;
-  availableModels: string[];
-}
-
-interface ModelRate {
-  poolId: string;
-  protocol: Protocol;
-  inputPerMillion: string;
-  outputPerMillion: string;
-  cachedInputPerMillion: string;
-  perRequest: string;
-  longContextThreshold: number | null;
-  longContextMultiplier: string;
-  peakMultiplier: string | number;
-}
-
-interface LeaseContext {
-  id: string;
-  requestId: string;
-  key: KeyContext;
-  credential: CredentialContext;
-  rate: ModelRate;
-}
-
-type Inference = ReturnType<typeof prepareInference>;
-type Outcome = 'SUCCEEDED' | 'FAILED' | 'CANCELLED';
-
-const emptyUsage: Usage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, imageCount: 0, estimated: false };
 const bearerBlocked = new Set([401, 402, 403]);
-const unavailable = () => new AppError(503, 'UPSTREAM_UNAVAILABLE', 'No verified upstream account is available for this key');
 
-function keyHash(request: FastifyRequest): string {
-  const token = request.headers.authorization?.match(/^Bearer\s+(\S{1,300})$/i)?.[1]
-    ?? request.headers['x-api-key'] ?? request.headers['x-goog-api-key'];
-  if (typeof token !== 'string' || !/^\S{1,300}$/.test(token)) throw new AppError(401, 'INVALID_API_KEY', 'Missing or invalid API key');
-  return sha256(token);
-}
-
-async function resolveKey(db: postgres.Sql | postgres.TransactionSql, hash: string, lock = false): Promise<KeyContext> {
-  const [key] = await db<KeyContext[]>`
-    SELECT ak.id, ak.status, ak.credits_total::text, ak.credits_used::text, ak.concurrency_limit, ak.expires_at,
-      ak.upstream_credential_id, uc.pool_id AS primary_pool_id, o.pool_id,
-      COALESCE(o.credit_amount, o.amount)::text AS amount, o.payment_provider, o.wholesale_credits::text,
-      (o.payment_provider = 'mock' OR COALESCE(o.metadata->>'testPayment' = 'true', false)) AS test_payment,
-      u.status AS user_status, up.active AS pool_active
-    FROM api_keys ak JOIN users u ON u.id = ak.user_id
-    JOIN orders o ON o.id = ak.order_id
-    JOIN upstream_credentials uc ON uc.id = ak.upstream_credential_id
-    JOIN upstream_pools up ON up.id = o.pool_id
-    WHERE ak.key_hash = ${hash}
-    ${lock ? db`FOR UPDATE OF ak` : db``}
-  `;
-  if (!key) throw new AppError(401, 'INVALID_API_KEY', 'Invalid API key');
-  if (key.testPayment && (config.NODE_ENV === 'production'
-    || (key.paymentProvider === 'mock' ? !config.ALLOW_MOCK_PAYMENTS : !config.YOOKASSA_TEST_MODE))) {
-    throw new AppError(403, 'TEST_KEY_DISABLED', 'Test payment keys are not enabled in this environment');
-  }
-  if (key.userStatus !== 'ACTIVE') throw new AppError(403, 'USER_INACTIVE', 'This account is suspended');
-  if (key.status === 'EXHAUSTED' || (key.status === 'ACTIVE' && new Decimal(key.creditsUsed).gte(key.creditsTotal))) {
-    throw new AppError(402, 'CREDITS_EXHAUSTED', 'API key credits are exhausted');
-  }
-  if (key.status === 'EXPIRED' || (key.expiresAt && key.expiresAt.getTime() <= Date.now())) {
-    throw new AppError(403, 'API_KEY_EXPIRED', 'API key has expired');
-  }
-  if (key.status !== 'ACTIVE') throw new AppError(403, 'API_KEY_INACTIVE', 'API key is inactive');
-  if (!key.poolActive) throw unavailable();
-  return key;
-}
-
-const busy = () => new AppError(429, 'UPSTREAM_BUSY', 'The model is busy. Retry shortly');
-
-async function activeCredential(transaction: postgres.TransactionSql, key: KeyContext, rate: ModelRate, model: string, minimumBudget: string): Promise<CredentialContext> {
-  const [assignment] = await transaction<{ upstreamCredentialId: string }[]>`
-    SELECT upstream_credential_id FROM api_key_channel_assignments
-    WHERE api_key_id = ${key.id} AND pool_id = ${rate.poolId}
-  `;
-  const assignedId = rate.poolId === key.primaryPoolId ? key.upstreamCredentialId : assignment?.upstreamCredentialId;
-
-  async function find(id: string) {
-    const [credential] = await transaction<CredentialContext[]>`
-      SELECT uc.id, uc.encrypted_key, uc.max_concurrency, uc.spend_limit::text, uc.spend_used::text, uc.available_models,
-        up.slug AS provider_slug, up.base_url
-      FROM upstream_credentials uc JOIN upstream_pools up ON up.id = uc.pool_id
-      JOIN sellable_upstream_slots s ON s.id = uc.id
-      WHERE uc.id = ${id} AND uc.pool_id = ${rate.poolId} AND ${model} = ANY(uc.available_models)
-        AND (NOT s.test_only OR ${key.paymentProvider === 'mock'})
-        AND (uc.spend_limit IS NULL OR uc.spend_limit - uc.spend_used - COALESCE((
-          SELECT sum(lease.reserved_cost) FROM request_leases lease
-          WHERE lease.upstream_credential_id = uc.id AND lease.expires_at > now()
-        ), 0) >= ${minimumBudget}::numeric)
-      FOR UPDATE OF uc
-    `;
-    return credential;
-  }
-
-  const assigned = assignedId ? await find(assignedId) : undefined;
-  if (assigned) return assigned;
-  const replacement = await selectCredentialWithCapacity(transaction, rate.poolId, {
-    model, minimumBudget, apiKeyId: key.id, allowTest: key.paymentProvider === 'mock',
-  }).catch(async error => {
-    if (assignedId && error instanceof AppError && error.code === 'NO_UPSTREAM_CAPACITY') {
-      const [previousModel] = await transaction`SELECT 1 FROM upstream_credentials
-        WHERE id = ${assignedId} AND ${model} = ANY(available_models)`;
-      if (previousModel) throw unavailable();
-    }
-    throw error;
-  });
-  const credential = await find(replacement.id);
-  if (!credential) throw unavailable();
-  if (rate.poolId === key.primaryPoolId) {
-    await transaction`UPDATE api_keys SET upstream_credential_id = ${credential.id}, updated_at = now() WHERE id = ${key.id}`;
-  } else {
-    await transaction`
-      INSERT INTO api_key_channel_assignments (api_key_id, pool_id, upstream_credential_id)
-      VALUES (${key.id}, ${rate.poolId}, ${credential.id})
-      ON CONFLICT (api_key_id, pool_id) DO UPDATE SET upstream_credential_id = EXCLUDED.upstream_credential_id
-    `;
-  }
-  return credential;
-}
-
-async function listModels(hash: string, gemini: boolean) {
+async function listModels(hash: string, gemini: boolean, anthropic = false) {
   const key = await resolveKey(sql, hash);
   const rows = await sql<{ model: string; protocol: Protocol }[]>`
     SELECT model, protocol FROM usable_key_models
-    WHERE api_key_id = ${key.id} AND (${!gemini} OR protocol = 'GEMINI') ORDER BY model
+    WHERE api_key_id = ${key.id} AND (${!gemini} OR protocol = 'GEMINI') AND (${!anthropic} OR protocol = 'ANTHROPIC') ORDER BY model
   `;
   if (gemini) return { models: rows.map(({ model }) => ({
-    name: `models/${model}`, displayName: model, supportedGenerationMethods: ['generateContent', 'streamGenerateContent'],
+    name: `models/${model}`, displayName: model, supportedGenerationMethods: ['generateContent', 'streamGenerateContent', 'countTokens'],
   })) };
+  if (anthropic) return { data: rows.map(({ model }) => ({ id: model, type: 'model', display_name: model, created_at: '1970-01-01T00:00:00Z' })),
+    has_more: false, first_id: rows[0]?.model ?? null, last_id: rows.at(-1)?.model ?? null };
   if (!rows.length && !(await sql`SELECT 1 FROM pool_channels JOIN sellable_upstream_slots USING (pool_id)
     WHERE root_pool_id = ${key.poolId} LIMIT 1`).length) throw unavailable();
   const models = new Map<string, Protocol[]>();
@@ -181,129 +35,6 @@ async function listModels(hash: string, gemini: boolean) {
     models.set(row.model, protocols);
   }
   return { object: 'list', data: [...models].map(([id, protocols]) => ({ id, object: 'model', created: 0, owned_by: 'unknown', protocols })) };
-}
-
-async function acquireLease(hash: string, endpoint: string, requestBody: Inference): Promise<LeaseContext> {
-  const { model, buffer, outputBudget, images } = requestBody;
-  return sql.begin(async (transaction) => {
-    const key = await resolveKey(transaction, hash, true);
-    const rates = await transaction<ModelRate[]>`
-      SELECT pool_id, protocol, input_per_million::text, output_per_million::text, cached_input_per_million::text,
-        per_request::text, long_context_threshold, long_context_multiplier::text, peak_multiplier::text
-      FROM routable_pool_models WHERE root_pool_id = ${key.poolId} AND model = ${model}
-        AND protocol = ANY(${transaction.array(inferenceProtocols[endpoint] ?? [])}::text[])
-      ORDER BY routing_priority DESC, pool_id
-    `;
-    if (rates.length === 0) throw new AppError(404, 'MODEL_NOT_PRICED', 'This model is not enabled for this API endpoint');
-    const multiplier = retailMultiplier(key.amount, key.wholesaleCredits);
-    let selection: { credential: CredentialContext; rate: ModelRate; estimate: Decimal; customerEstimate: Decimal } | undefined;
-    let lastError: AppError | undefined;
-    for (const row of rates) {
-      if (images && new Decimal(row.perRequest).lte(0)) continue;
-      try {
-        // A failed candidate rolls back provisional assignment and row locks.
-        selection = await transaction.savepoint(async (attempt) => {
-          const rate = { ...row, peakMultiplier: activePeakMultiplier(row.peakMultiplier) };
-          const estimatedCost = calculateUsageCost({
-            ...rate, inputTokens: images ? 0 : Math.ceil(buffer.length / 3), outputTokens: outputBudget,
-            cachedInputTokens: 0, imageCount: images, cacheWrite1hTokens: requestBody.cacheWrite ? Math.ceil(buffer.length / 3) : 0,
-          });
-          const estimate = estimatedCost.toDecimalPlaces(8);
-          const customerEstimate = retailUsageCost(estimatedCost, multiplier);
-          const credential = await activeCredential(attempt, key, rate, model, estimate.toFixed(8));
-          const [leases] = await attempt<{ keyCount: number; credentialCount: number; keyReserved: string; credentialReserved: string }[]>`
-            SELECT count(*) FILTER (WHERE api_key_id = ${key.id})::int AS key_count,
-              count(*) FILTER (WHERE upstream_credential_id = ${credential.id})::int AS credential_count,
-              COALESCE(sum(retail_reserved_cost) FILTER (WHERE api_key_id = ${key.id}), 0)::text AS key_reserved,
-              COALESCE(sum(reserved_cost) FILTER (WHERE upstream_credential_id = ${credential.id}), 0)::text AS credential_reserved
-            FROM request_leases WHERE expires_at > now() AND (api_key_id = ${key.id} OR upstream_credential_id = ${credential.id})
-          `;
-          if ((leases?.keyCount ?? 0) >= key.concurrencyLimit) throw new AppError(429, 'KEY_CONCURRENCY_LIMIT', 'API key concurrency limit reached');
-          if ((leases?.credentialCount ?? 0) >= credential.maxConcurrency) throw busy();
-          if (customerEstimate.gt(new Decimal(key.creditsTotal).sub(key.creditsUsed).sub(leases?.keyReserved ?? '0'))) {
-            throw new AppError(402, 'INSUFFICIENT_CREDITS', 'Not enough balance for this request. Reduce the output limit or add balance');
-          }
-          if (credential.spendLimit !== null
-            && estimate.gt(new Decimal(credential.spendLimit).sub(credential.spendUsed).sub(leases?.credentialReserved ?? '0'))) {
-            throw new AppError(503, 'UPSTREAM_BUDGET_UNAVAILABLE', 'The model is temporarily unavailable');
-          }
-          return { credential, rate, estimate, customerEstimate };
-        });
-        break;
-      } catch (error) {
-        if (!(error instanceof AppError) || error.code === 'KEY_CONCURRENCY_LIMIT') throw error;
-        if (error.code !== 'NO_UPSTREAM_CAPACITY') lastError ??= error;
-      }
-    }
-    if (!selection) {
-      if (lastError) throw lastError;
-      const [channel] = await transaction`SELECT 1 FROM sellable_upstream_slots s WHERE s.pool_id = ANY(${transaction.array(rates.map(({ poolId }) => poolId))}::uuid[]) LIMIT 1`;
-      if (channel) throw new AppError(404, 'MODEL_NOT_AVAILABLE', 'This model is not currently available for your key');
-      throw unavailable();
-    }
-    const { credential, rate, estimate, customerEstimate } = selection;
-    const [lease] = await transaction<{ id: string }[]>`
-      INSERT INTO request_leases (api_key_id, upstream_credential_id, expires_at, reserved_cost, retail_reserved_cost)
-      VALUES (${key.id}, ${credential.id}, ${new Date(Date.now() + config.UPSTREAM_REQUEST_TIMEOUT_MS + 60_000)},
-        ${estimate.toFixed(8)}, ${customerEstimate.toFixed(8)}) RETURNING id
-    `;
-    if (!lease) throw new Error('Request lease was not created');
-    const requestId = randomUUID();
-    await transaction`
-      INSERT INTO usage_records (api_key_id, upstream_credential_id, request_id, endpoint, model, status)
-      VALUES (${key.id}, ${credential.id}, ${requestId}, ${endpoint}, ${model}, 'STARTED')
-    `;
-    return { id: lease.id, requestId, key, credential, rate };
-  });
-}
-
-async function finalizeUsage(lease: LeaseContext, model: string, result: {
-  usage: Usage | null; status: Outcome; httpStatus?: number | undefined; errorCode?: string | undefined;
-}): Promise<void> {
-  const { usage, status, httpStatus, errorCode } = result;
-  const accounting = usage ?? emptyUsage;
-  const measuredCost = usage ? calculateUsageCost({ ...usage, ...lease.rate }) : new Decimal(0);
-  const cost = measuredCost.toDecimalPlaces(8);
-  const posted = await sql.begin(async (transaction) => {
-    const [balance] = await transaction<{ remaining: string }[]>`
-      SELECT GREATEST(credits_total - credits_used, 0)::text AS remaining
-      FROM api_keys WHERE id = ${lease.key.id} FOR UPDATE
-    `;
-    const charge = Decimal.min(balance?.remaining ?? 0,
-      retailUsageCost(measuredCost, retailMultiplier(lease.key.amount, lease.key.wholesaleCredits)));
-    const updated = await transaction`
-      UPDATE usage_records SET input_tokens = ${accounting.inputTokens}, output_tokens = ${accounting.outputTokens},
-        cached_input_tokens = ${accounting.cachedInputTokens}, image_count = ${accounting.imageCount},
-        cache_write_5m_tokens = ${accounting.cacheWrite5mTokens ?? 0}, cache_write_1h_tokens = ${accounting.cacheWrite1hTokens ?? 0},
-        cost = ${cost.toFixed(8)}, retail_cost = ${charge.toFixed(8)}, status = ${status}, http_status = ${httpStatus ?? null},
-        error_code = ${errorCode ?? (accounting.estimated ? 'ESTIMATED_USAGE' : null)}, completed_at = now()
-      WHERE request_id = ${lease.requestId} AND status = 'STARTED' RETURNING id
-    `;
-    if (updated.length && (cost.gt(0) || charge.gt(0))) {
-      await transaction`
-        UPDATE api_keys SET credits_used = credits_used + ${charge.toFixed(8)}, last_used_at = now(),
-          status = CASE WHEN status = 'ACTIVE' AND credits_used + ${charge.toFixed(8)} >= credits_total THEN 'EXHAUSTED' ELSE status END,
-          updated_at = now() WHERE id = ${lease.key.id}
-      `;
-      await transaction`
-        UPDATE upstream_credentials SET spend_used = spend_used + ${cost.toFixed(8)},
-          status = CASE WHEN status IN ('ACTIVE', 'DEGRADED') AND spend_limit IS NOT NULL
-            AND spend_used + ${cost.toFixed(8)} >= spend_limit THEN 'EXHAUSTED' ELSE status END,
-          last_used_at = now(), updated_at = now() WHERE id = ${lease.credential.id}
-      `;
-    }
-    if (updated.length && errorCode?.includes('UNCONFIRMED')) {
-      // Keep the reservation briefly after an unconfirmed request. A client cannot
-      // continuously cancel streams and immediately reuse the same reserved balance.
-      await transaction`UPDATE request_leases SET expires_at = ${new Date(Date.now() + config.PROXY_UNCONFIRMED_COOLDOWN_MS)}
-        WHERE id = ${lease.id}`;
-    } else await transaction`DELETE FROM request_leases WHERE id = ${lease.id}`;
-    return updated.length > 0;
-  });
-  if (posted && cost.gt(0)) usageCost.inc({ provider: lease.credential.providerSlug, model }, cost.toNumber());
-  if (posted && (accounting.estimated || errorCode?.includes('UNCONFIRMED'))) {
-    proxyAccountingAnomalies.inc({ provider: lease.credential.providerSlug, kind: accounting.estimated ? 'estimated' : 'unconfirmed' });
-  }
 }
 
 async function markDegraded(credential: CredentialContext, reason: string): Promise<void> {
@@ -341,16 +72,36 @@ async function readBody(response: Response, limit: number, onFirstByte?: () => v
 }
 
 export async function proxyRoutes(app: FastifyInstance): Promise<void> {
+  await videoRoutes(app);
   for (const prefix of ['/v1/*', '/v1beta/*']) app.all(prefix, { bodyLimit: 32 * 1024 * 1024 }, async (request, reply) => {
     const endpoint = enabledEndpoint(request);
     const hash = keyHash(request);
-    if (endpoint === '/v1/models' || endpoint === '/v1beta/models') {
+    if (endpoint === '/v1/models' || endpoint === '/v1beta/models' || endpoint.endsWith('/models/:model')) {
       reply.header('cache-control', 'no-store');
-      return listModels(hash, endpoint === '/v1beta/models');
+      const gemini = endpoint.startsWith('/v1beta/');
+      const catalog = await listModels(hash, gemini, !gemini && !!(request.headers['anthropic-version'] || request.headers['x-api-key']));
+      const items = 'models' in catalog ? catalog.models! : catalog.data!;
+      if (endpoint.endsWith('/:model')) {
+        const id = request.url.split('?', 1)[0]!.split('/').at(-1);
+        const item = items.find(value => ('name' in value ? value.name === `models/${id}` : value.id === id));
+        if (!item) throw new AppError(404, 'MODEL_NOT_AVAILABLE', 'This model is not available for your key');
+        return item;
+      }
+      const query = new URL(request.url, 'http://proxy.invalid').searchParams;
+      const limit = Number(query.get(gemini ? 'pageSize' : 'limit') ?? 1000);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new AppError(400, 'INVALID_PAGE_SIZE', 'Page size must be from 1 to 1000');
+      const cursor = query.get(gemini ? 'pageToken' : 'after_id');
+      const index = cursor ? items.findIndex(value => ('name' in value ? value.name === `models/${cursor}` : value.id === cursor)) : -1;
+      if (cursor && index < 0) throw new AppError(400, 'INVALID_PAGE_TOKEN', 'Invalid page cursor');
+      const page = items.slice(index + 1, index + 1 + limit);
+      const more = items.length > index + 1 + limit;
+      if (gemini) return { models: page, ...(more && { nextPageToken: (page.at(-1) as { name: string }).name.replace(/^models\//, '') }) };
+      return { ...catalog, data: page, ...('has_more' in catalog && { has_more: more, first_id: (page[0] as { id: string } | undefined)?.id ?? null,
+        last_id: (page.at(-1) as { id: string } | undefined)?.id ?? null }) };
     }
 
     const key = await resolveKey(sql, hash);
-    const body = prepareInference(request, endpoint, key.id);
+    const body = endpoint.startsWith('/v1/images/') ? await prepareMedia(request) : prepareInference(request, endpoint, key.id);
     const lease = await acquireLease(hash, endpoint, body);
     const { credential } = lease;
     const provider = credential.providerSlug;
@@ -380,6 +131,7 @@ export async function proxyRoutes(app: FastifyInstance): Promise<void> {
       const upstreamSecret = decryptSecret(credential.encryptedKey);
       upstreamAttempted = true;
       const headers = nativeHeaders(upstreamHeaders(request, lease.key.id, upstreamSecret, lease.requestId), request, endpoint, upstreamSecret);
+      headers.set('content-type', body.contentType);
       const response = await fetch(`${credential.baseUrl.replace(/\/+$/, '')}${body.upstreamPath}`, {
         method: 'POST', headers,
         body: new Uint8Array(body.buffer), redirect: 'manual', signal,
@@ -411,7 +163,7 @@ export async function proxyRoutes(app: FastifyInstance): Promise<void> {
 
       updateClientHeaders(response, reply, lease.requestId);
       reply.code(response.status);
-      if (contentType.includes('text/event-stream') && response.body) {
+      if (!body.countOnly && contentType.includes('text/event-stream') && response.body) {
         tracker = new StreamUsageTracker(lease.rate.protocol);
         reply.hijack();
         streamOpened = true;
@@ -457,14 +209,26 @@ export async function proxyRoutes(app: FastifyInstance): Promise<void> {
         throw new AppError(502, 'UPSTREAM_INVALID_RESPONSE', 'Expected a JSON or event-stream response');
       }
       const payload = await readBody(response, 32 * 1024 * 1024, observeFirstByte);
-      let parsed: { status?: string; error?: unknown; data?: unknown[] };
+      let parsed: { status?: string; error?: unknown; data?: unknown[]; input_tokens?: unknown; totalTokens?: unknown };
       try { parsed = JSON.parse(payload.toString('utf8')); } catch { throw new AppError(502, 'UPSTREAM_INVALID_RESPONSE', 'Provider returned invalid JSON'); }
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new AppError(502, 'UPSTREAM_INVALID_RESPONSE', 'Provider returned invalid JSON');
+      if (body.countOnly) {
+        const count = endpoint.endsWith('/countTokens') ? parsed.totalTokens : parsed.input_tokens;
+        if (parsed.error || typeof count !== 'number' || !Number.isSafeInteger(count) || count < 0) throw new AppError(502, 'UPSTREAM_INVALID_RESPONSE', 'Provider returned no valid token count');
+        await finalize({ usage: null, status: 'SUCCEEDED', httpStatus: response.status });
+        return reply.send(payload);
+      }
       const ok = parsed.status !== 'failed' && !parsed.error;
       if (!ok) statusLabel = '502';
       if (body.images && ok && !Array.isArray(parsed.data)) {
         throw new AppError(502, 'UPSTREAM_INVALID_RESPONSE', 'Provider returned no image results');
       }
+      if (body.images && ok && parsed.data && (parsed.data.length > body.images || parsed.data.some(image => {
+        if (!image || typeof image !== 'object') return true;
+        const item = image as { b64_json?: unknown; url?: unknown };
+        return !(typeof item.b64_json === 'string' && item.b64_json.length > 0)
+          && !(typeof item.url === 'string' && /^https:\/\//.test(item.url));
+      }))) throw new AppError(502, 'UPSTREAM_INVALID_RESPONSE', 'Provider returned invalid image results');
       const imageCount = body.images && Array.isArray(parsed.data) ? parsed.data.length : 0;
       const measured = body.images ? (ok && imageCount > 0 ? { ...emptyUsage, imageCount } : null) : extractUsage(parsed, lease.rate.protocol);
       await finalize({ usage: measured,

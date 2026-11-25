@@ -32,6 +32,8 @@ export function calculateUsageCost(input: {
   cacheWrite5mTokens?: number;
   cacheWrite1hTokens?: number;
   imageCount: number;
+  videoSeconds?: number;
+  perSecond?: Decimal.Value;
   requestCount?: number;
   inputPerMillion: Decimal.Value;
   outputPerMillion: Decimal.Value;
@@ -57,5 +59,6 @@ export function calculateUsageCost(input: {
     tokenCost = tokenCost.mul(input.longContextMultiplier ?? 1);
   }
   return tokenCost.mul(input.peakMultiplier ?? 1)
+    .add(new Decimal(input.videoSeconds ?? 0).mul(input.perSecond ?? 0))
     .add(new Decimal(input.requestCount ?? (input.imageCount || 1)).mul(input.perRequest));
 }

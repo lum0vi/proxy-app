@@ -7,6 +7,7 @@ export interface Usage {
   cacheWrite5mTokens?: number;
   cacheWrite1hTokens?: number;
   imageCount: number;
+  videoSeconds?: number;
   estimated: boolean;
 }
 

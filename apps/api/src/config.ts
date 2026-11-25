@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { z } from 'zod';
+import { tonAddress } from './lib/ton.js';
 import { browserOrigins } from './lib/browser-origins.js';
 
 const envBoolean = z
@@ -48,11 +49,12 @@ const envSchema = z.object({
   CE_PROVISION_FREE_SLOTS: z.coerce.number().int().min(1).max(100).default(2),
   UPSTREAM_REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().default(900_000),
   UPSTREAM_HEALTH_INTERVAL_MS: z.coerce.number().int().positive().default(300_000),
+  VIDEO_JOB_TIMEOUT_MS: z.coerce.number().int().min(60_000).max(604_800_000).default(86_400_000),
   PROXY_ASSUMED_MAX_OUTPUT_TOKENS: z.coerce.number().int().min(1).max(1_000_000).default(128_000),
   PROXY_UNCONFIRMED_COOLDOWN_MS: z.coerce.number().int().min(1_000).max(3_600_000).default(60_000),
   FORCE_STREAM_USAGE: booleanString(true),
   AFFINITY_TTL_HOURS: z.coerce.number().int().positive().default(24),
-  PROXY_ALLOWED_PATHS: z.string().default('/v1/models,/v1/responses,/v1/responses/compact,/v1/chat/completions,/v1/images/generations,/v1/messages,/v1beta/models,/v1beta/generateContent,/v1beta/streamGenerateContent'),
+  PROXY_ALLOWED_PATHS: z.string().default('/v1/models,/v1/responses,/v1/responses/compact,/v1/chat/completions,/v1/images/generations,/v1/images/edits,/v1/videos,/v1/messages,/v1/messages/count_tokens,/v1beta/models,/v1beta/generateContent,/v1beta/streamGenerateContent,/v1beta/countTokens'),
   PAYMENT_METHODS: z.string().default('mock'),
   PAYMENT_CURRENCIES: z.string().default('USDT'),
   SALES_ENABLED: envBoolean.optional(),
@@ -63,6 +65,13 @@ const envSchema = z.object({
   NOWPAYMENTS_IPN_SECRET: z.string().default(''),
   NOWPAYMENTS_PAY_CURRENCY: z.literal('usdtton').default('usdtton'),
   NOWPAYMENTS_API_URL: z.string().url().default('https://api.nowpayments.io/v1'),
+  TON_RECEIVER_ADDRESS: z.string().trim().default('').refine(value => {
+    try { return !value || Boolean(tonAddress(value)); } catch { return false; }
+  }, 'Use a valid mainnet TON wallet address'),
+  TONCENTER_API_KEY: z.string().default(''),
+  TONCENTER_API_URL: z.string().url().default('https://toncenter.com/api/v3'),
+  TON_AUTO_APPROVE: booleanString(true),
+  TON_INVOICE_TTL_MINUTES: z.coerce.number().int().min(10).max(1440).default(60),
   YOOKASSA_SHOP_ID: z.string().default(''),
   YOOKASSA_SECRET_KEY: z.string().default(''),
   YOOKASSA_API_URL: z.string().url().default('https://api.yookassa.ru/v3'),
@@ -94,14 +103,14 @@ if (!allowedPaymentCurrencies.length || allowedPaymentCurrencies.some(value => !
   throw new Error('PAYMENT_CURRENCIES must contain USDT and/or RUB');
 }
 const paymentCurrencies = allowedPaymentCurrencies.filter(currency => paymentMethods.some(method => method === 'mock'
-  || (currency === 'RUB' ? method === 'yookassa' : method === 'nowpayments')));
+  || (currency === 'RUB' ? method === 'yookassa' : ['nowpayments', 'ton'].includes(method))));
 
 if (!/[1-9]/.test(parsed.data.PRICE_MARKUP)) throw new Error('PRICE_MARKUP must be positive');
 if (!/[1-9]/.test(parsed.data.BILLING_USDT_PER_USD)) throw new Error('BILLING_USDT_PER_USD must be positive');
 if (parsed.data.USDT_RUB_RATE && !/[1-9]/.test(parsed.data.USDT_RUB_RATE)) throw new Error('USDT_RUB_RATE must be positive');
 
 for (const method of paymentMethods) {
-  if (!['yookassa', 'nowpayments', 'mock'].includes(method)) {
+  if (!['yookassa', 'nowpayments', 'ton', 'mock'].includes(method)) {
     throw new Error(`Unsupported payment method: ${method}`);
   }
 }
@@ -127,6 +136,10 @@ if (parsed.data.NODE_ENV === 'production') {
     throw new Error('NOWPayments is enabled but its API key or IPN secret is missing');
   }
   if (env.NOWPAYMENTS_API_URL !== 'https://api.nowpayments.io/v1') throw new Error('Use the official NOWPayments API in production');
+  if (paymentMethods.includes('ton') && (!env.TON_RECEIVER_ADDRESS || !env.TONCENTER_API_KEY)) {
+    throw new Error('Configure TON_RECEIVER_ADDRESS and TONCENTER_API_KEY before enabling direct TON payments');
+  }
+  if (env.TONCENTER_API_URL !== 'https://toncenter.com/api/v3') throw new Error('Use the mainnet TON Center API in production');
   if (paymentMethods.includes('yookassa') && (!env.YOOKASSA_SHOP_ID || !env.YOOKASSA_SECRET_KEY || env.YOOKASSA_TEST_MODE)) {
     throw new Error('Configure live YooKassa credentials and disable YOOKASSA_TEST_MODE for production payments');
   }

@@ -57,6 +57,14 @@ async function seed(): Promise<void> {
     `;
   }
 
+  await sql`
+    INSERT INTO products (pool_id, name, slug, wholesale_credits, currency, duration_days, concurrency_limit)
+    VALUES (${pool.id}, 'Mini Key', 'mini-key', 0.5, 'USDT', NULL, 1),
+      (${pool.id}, 'Starter Key', 'starter-key', 1, 'USDT', NULL, 1),
+      (${pool.id}, 'Basic Key', 'basic-key', 2.5, 'USDT', NULL, 1)
+    ON CONFLICT (slug) DO NOTHING
+  `;
+
   const admins = await sql<{ count: string }[]>`SELECT count(*)::text AS count FROM users WHERE role = 'ADMIN'`;
   if (Number(admins[0]?.count ?? 0) === 0) {
     const passwordHash = await hashPassword(config.ADMIN_PASSWORD);

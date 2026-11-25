@@ -93,7 +93,7 @@ paths:
                     description: Enabled checkout currencies. The initial production release enables USDT only.
                   paymentMethods:
                     type: array
-                    items: { enum: [yookassa, nowpayments, mock] }
+                    items: { enum: [yookassa, nowpayments, ton, mock] }
   /api/auth/register:
     post:
       tags: [Authentication]
@@ -193,7 +193,7 @@ paths:
                     items: { enum: [USDT, RUB] }
                   paymentMethods:
                     type: array
-                    items: { enum: [yookassa, nowpayments, mock] }
+                    items: { enum: [yookassa, nowpayments, ton, mock] }
                   cryptoCurrency:
                     type: [string, 'null']
                     description: USDT when crypto checkout is enabled.
@@ -237,6 +237,7 @@ paths:
         - { name: cacheWrite5mTokens, in: query, description: Claude input tokens written to the five-minute cache., schema: { type: integer, minimum: 0, maximum: 1000000, default: 0 } }
         - { name: cacheWrite1hTokens, in: query, description: Claude input tokens written to the one-hour cache., schema: { type: integer, minimum: 0, maximum: 1000000, default: 0 } }
         - { name: outputTokens, in: query, schema: { type: integer, minimum: 0, maximum: 128000, default: 0 } }
+        - { name: videoSeconds, in: query, description: Allowed video duration., schema: { type: integer, minimum: 1, maximum: 120 } }
         - { name: imageCount, in: query, description: Number of images for an image model (defaults to one)., schema: { type: integer, minimum: 1, maximum: 10 } }
       responses:
         '200':
@@ -290,7 +291,7 @@ paths:
               required: [productId, paymentProvider]
               properties:
                 productId: { type: string, format: uuid }
-                paymentProvider: { enum: [yookassa, nowpayments, mock] }
+                paymentProvider: { enum: [yookassa, nowpayments, ton, mock] }
                 paymentCurrency:
                   type: string
                   enum: [RUB, USDT]
@@ -593,8 +594,37 @@ paths:
       summary: Create or update a provider model rate
       operationId: upsertModelRate
       security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [poolId, model, inputPerMillion, outputPerMillion, cachedInputPerMillion]
+              properties:
+                poolId: { type: string, format: uuid }
+                model: { type: string, minLength: 1, maxLength: 200 }
+                inputPerMillion: { type: string, description: Wholesale input token price per million. }
+                outputPerMillion: { type: string, description: Wholesale output token price per million. }
+                cachedInputPerMillion: { type: string }
+                perRequest: { type: string, default: '0', description: Wholesale price per returned image. }
+                perSecond: { type: string, default: '0', description: Positive for VIDEOS; token and perRequest prices must be zero for video. }
+                mediaOptions:
+                  type: object
+                  description: All allowed variants must have the same price. VIDEOS requires seconds as a list of integers from 1 to 120; image editing requires operations containing edit. Configured price options must be explicitly specified by the client.
+                  propertyNames: { enum: [seconds, size, quality, background, input_fidelity, resolution, aspect_ratio, audio, operations] }
+                  additionalProperties:
+                    type: array
+                    minItems: 1
+                    maxItems: 30
+                    items: { type: [string, number, boolean] }
+                longContextThreshold: { type: [integer, 'null'], minimum: 1, default: null }
+                longContextMultiplier: { type: string, default: '1' }
+                peakMultiplier: { type: number, minimum: 1, maximum: 10 }
+                active: { type: boolean, default: true }
       responses:
         '200': { description: Rate saved }
+        '400': { $ref: '#/components/responses/Error' }
   /api/admin/users:
     get:
       tags: [Admin]
@@ -912,6 +942,79 @@ paths:
         '400': { description: Invalid notification or payment does not match the saved order. }
         '502': { description: Provider unavailable or returned invalid payment data; retry delivery. }
         '503': { description: Payment API unavailable or checkout not saved yet; retry delivery. }
+  /api/orders/{id}/payment-claim:
+    post:
+      tags: [Store]
+      summary: Submit a TON transaction hash for manual review; does not credit a payment
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [transactionHash]
+              properties:
+                transactionHash: { type: string, minLength: 43, maxLength: 64 }
+      responses:
+        '200': { description: Review request saved for the authenticated order owner }
+        '404': { description: Unpaid TON order not found }
+  /api/admin/payments/ton:
+    get:
+      tags: [Admin]
+      summary: TON wallet configuration, scan health, verified receipts and customer review requests
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Up to 200 latest receipts and open orders; requires ADMIN }
+  /api/admin/payments/ton/inspect:
+    post:
+      tags: [Admin]
+      summary: Fetch and verify finalized USDT actions by transaction hash from TON Center
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [orderId, transactionHash]
+              properties:
+                orderId: { type: string, format: uuid }
+                transactionHash: { type: string, minLength: 43, maxLength: 64 }
+      responses:
+        '200': { description: Verified receipts saved; exact invoice matches may be credited automatically }
+        '409': { description: No finalized USDT transfer to the invoice wallet }
+        '503': { description: Indexer unavailable; no unverified payment credited }
+  /api/admin/payments/ton/{id}/review:
+    post:
+      tags: [Admin]
+      summary: Approve or reject an indexed TON receipt with an audited reason
+      description: Approval requires a full payment to the invoice wallet after order creation. A transfer cannot be reused. Rejecting does not initiate an on-chain refund.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision, note]
+              properties:
+                decision: { enum: [approve, reject] }
+                orderId: { type: string, format: uuid, description: Required when the receipt has no matched invoice }
+                note: { type: string, minLength: 10, maxLength: 1000 }
+      responses:
+        '200': { description: Decision committed atomically with order payment and audit log }
+        '409': { description: Underpaid, reused, mismatched or already settled payment }
   /api/webhooks/nowpayments:
     post:
       tags: [Store]
@@ -933,6 +1036,196 @@ paths:
         '400': { description: Invalid signature, coin, amount or payment ID. }
         '503': { description: Checkout not saved yet; retry delivery. }
 
+  /v1/models/{model}:
+    parameters: [{ $ref: '#/components/parameters/GeminiModel' }]
+    get:
+      tags: [OpenAI proxy]
+      operationId: retrieveModel
+      summary: Retrieve an available model (Anthropic envelope when using Anthropic headers)
+      security: [{ downstreamKey: [] }, { anthropicKey: [] }]
+      responses:
+        '200': { description: Model metadata }
+        '404': { $ref: '#/components/responses/OpenAIError' }
+  /v1beta/models/{model}:
+    parameters: [{ $ref: '#/components/parameters/GeminiModel' }]
+    get:
+      tags: [Gemini]
+      operationId: retrieveGeminiModel
+      summary: Retrieve Gemini model metadata
+      security: [{ downstreamKey: [] }, { geminiKey: [] }]
+      responses:
+        '200': { description: Gemini model }
+  /v1/messages/count_tokens:
+    post:
+      tags: [Anthropic Messages]
+      operationId: countAnthropicTokens
+      summary: Count input tokens without a balance debit
+      description: Requires an active funded key and a provider supporting this method. Uses the same model routing and concurrency limits as Messages.
+      security: [{ downstreamKey: [] }, { anthropicKey: [] }]
+      parameters:
+        - { name: anthropic-version, in: header, schema: { type: string, default: '2023-06-01' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [model, messages], additionalProperties: true }
+      responses:
+        '200':
+          description: Token count
+          content:
+            application/json:
+              schema: { type: object, required: [input_tokens], properties: { input_tokens: { type: integer, minimum: 0 } } }
+  /v1beta/models/{model}:countTokens:
+    parameters: [{ $ref: '#/components/parameters/GeminiModel' }]
+    post:
+      tags: [Gemini]
+      operationId: countGeminiTokens
+      summary: Count inline Gemini input without a balance debit
+      security: [{ downstreamKey: [] }, { geminiKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                contents: { type: array, items: { type: object } }
+                generateContentRequest: { type: object, description: Inline request; any model must match the URL. }
+      responses:
+        '200':
+          description: Token count
+          content:
+            application/json:
+              schema: { type: object, required: [totalTokens], properties: { totalTokens: { type: integer, minimum: 0 } } }
+  /v1/images/edits:
+    post:
+      tags: [OpenAI proxy]
+      operationId: editImage
+      summary: Edit images with JSON references or SDK multipart uploads
+      description: Requires operations containing edit in the published model mediaOptions. Only PNG/JPEG/WebP uploads (at most 16 images, total request 32 MiB). No upstream file IDs. No streaming. The per-image price covers only configured size/quality options.
+      security: [{ downstreamKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, prompt]
+              properties:
+                model: { type: string }
+                prompt: { type: string, minLength: 1, maxLength: 32000 }
+                image: { type: string, description: HTTPS image URL or data URI; alternatively use images. }
+                images: { type: array, minItems: 1, maxItems: 16, items: { type: object, properties: { image_url: { type: string } } } }
+                n: { type: integer, minimum: 1, maximum: 10, default: 1 }
+          multipart/form-data:
+            schema:
+              type: object
+              required: [model, prompt, image]
+              properties:
+                model: { type: string }
+                prompt: { type: string }
+                image: { type: string, format: binary }
+                mask: { type: string, format: binary }
+                n: { type: integer, minimum: 1, maximum: 10 }
+      responses:
+        '200': { $ref: '#/components/responses/OpenAIProxyResponse' }
+        '400': { $ref: '#/components/responses/OpenAIError' }
+  /v1/videos:
+    post:
+      tags: [Videos]
+      operationId: createVideo
+      summary: Create a video job and reserve its quoted price
+      description: Compatible job lifecycle for providers implementing these routes; not a promise that a particular provider/model is available. Select an available VIDEOS model. No stored upstream file IDs. Completed jobs are charged once per confirmed second; failed jobs release the hold. Ambiguous submissions return a job with billing_status=review_required; keep its ID and contact support. Do not retry creation with a new idempotency key.
+      security: [{ downstreamKey: [] }]
+      parameters:
+        - { name: Idempotency-Key, in: header, description: Recommended; reuse only for the same request. Scoped to this customer key., schema: { type: string, minLength: 1, maxLength: 200 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VideoCreate' }
+          multipart/form-data:
+            schema:
+              allOf:
+                - { $ref: '#/components/schemas/VideoCreate' }
+                - { type: object, properties: { input_reference: { type: string, format: binary } } }
+      responses:
+        '200': { $ref: '#/components/responses/VideoJobResponse' }
+        '400': { $ref: '#/components/responses/OpenAIError' }
+        '402': { $ref: '#/components/responses/OpenAIError' }
+        '409': { $ref: '#/components/responses/OpenAIError' }
+        '429': { $ref: '#/components/responses/OpenAIError' }
+    get:
+      tags: [Videos]
+      operationId: listVideos
+      summary: List only the calling key's jobs; no charge
+      security: [{ downstreamKey: [] }]
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: after, in: query, schema: { type: string } }
+        - { name: order, in: query, schema: { enum: [asc, desc], default: desc } }
+      responses:
+        '200':
+          description: Paginated owned jobs with data and has_more
+          content:
+            application/json:
+              schema: { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/VideoJob' } }, has_more: { type: boolean } } }
+  /v1/videos/{id}:
+    parameters: [{ $ref: '#/components/parameters/VideoId' }]
+    get:
+      tags: [Videos]
+      operationId: retrieveVideo
+      summary: Retrieve job status; no additional charge
+      security: [{ downstreamKey: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/VideoJobResponse' }
+        '404': { $ref: '#/components/responses/OpenAIError' }
+  /v1/videos/{id}/content:
+    parameters: [{ $ref: '#/components/parameters/VideoId' }]
+    get:
+      tags: [Videos]
+      operationId: downloadVideo
+      summary: Download an owned completed video (also allowed for an exhausted key)
+      description: Streams at most 512 MiB without exposing provider URLs or credentials. Does not follow provider redirects. Revoked keys and suspended users cannot download.
+      security: [{ downstreamKey: [] }]
+      parameters:
+        - { name: variant, in: query, schema: { enum: [video, thumbnail, spritesheet], default: video } }
+        - { name: Range, in: header, schema: { type: string }, description: Single byte range. }
+      responses:
+        '200': { description: Video or image bytes, content: { video/mp4: { schema: { type: string, format: binary } } } }
+        '206': { description: Partial content }
+        '404': { $ref: '#/components/responses/OpenAIError' }
+        '409': { $ref: '#/components/responses/OpenAIError' }
+        '410': { $ref: '#/components/responses/OpenAIError' }
+  /api/admin/videos:
+    get:
+      tags: [Admin]
+      operationId: listAdminVideos
+      summary: Recent jobs, reservations and unresolved outcomes
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Admin-only jobs }
+  /api/admin/videos/{id}/reconcile:
+    parameters: [{ $ref: '#/components/parameters/UuidId' }]
+    post:
+      tags: [Admin]
+      operationId: reconcileVideo
+      summary: Verify the provider result or release a review reservation with an audit reason
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action, reason]
+              properties:
+                action: { enum: [refresh, release] }
+                upstreamId: { type: string, maxLength: 200 }
+                reason: { type: string, minLength: 10, maxLength: 1000 }
+      responses:
+        '200': { description: Updated video }
+        '409': { description: Already settled or provider result mismatch }
 components:
   securitySchemes:
     sessionCookie:
@@ -946,6 +1239,11 @@ components:
     anthropicKey: { type: apiKey, in: header, name: x-api-key }
     geminiKey: { type: apiKey, in: header, name: x-goog-api-key }
   parameters:
+    VideoId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, pattern: '^video_[a-f0-9-]{36}$' }
     UuidId:
       name: id
       in: path
@@ -980,6 +1278,11 @@ components:
             properties:
               password: { type: string, writeOnly: true }
   responses:
+    VideoJobResponse:
+      description: Owned job with a public video ID; no provider identifiers.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/VideoJob' }
     Error:
       description: Application error
       content:
@@ -1010,6 +1313,30 @@ components:
         text/event-stream:
           schema: { type: string }
   schemas:
+    VideoCreate:
+      type: object
+      required: [model, prompt, seconds]
+      properties:
+        model: { type: string, maxLength: 200 }
+        prompt: { type: string, minLength: 1, maxLength: 32000 }
+        seconds: { type: [string, integer], description: Must be present in the model mediaOptions.seconds; maximum 120. }
+        size: { type: string, description: An explicitly priced resolution; required when configured for the model. }
+    VideoJob:
+      type: object
+      required: [id, object, model, seconds, status, billing_status, progress, created_at]
+      properties:
+        id: { type: string, pattern: '^video_[a-f0-9-]{36}$' }
+        object: { const: video }
+        model: { type: string }
+        seconds: { type: string }
+        size: { type: [string, 'null'] }
+        status: { enum: [queued, in_progress, completed, failed] }
+        billing_status: { enum: [reserved, charged, released, review_required] }
+        progress: { type: integer, minimum: 0, maximum: 100 }
+        created_at: { type: integer }
+        completed_at: { type: [integer, 'null'] }
+        expires_at: { type: [integer, 'null'] }
+        error: { type: [object, 'null'] }
     ProviderInventoryKey:
       type: object
       properties:
@@ -1052,6 +1379,7 @@ components:
         currency: { const: USDT }
         creditsTotal: { type: string }
         creditsUsed: { type: string }
+        reservedCredits: { type: string, description: Balance held for unfinished requests and video jobs. }
         remainingUsdt: { type: string }
         expiresAt: { type: [string, 'null'], format: date-time }
         lastUsedAt: { type: [string, 'null'], format: date-time }
@@ -1167,18 +1495,23 @@ components:
       properties:
         model: { type: string }
         protocol:
-          enum: [OPENAI, OPENAI_CHAT, ANTHROPIC, GEMINI, IMAGES]
+          enum: [OPENAI, OPENAI_CHAT, ANTHROPIC, GEMINI, IMAGES, VIDEOS]
     PublicModelRate:
       type: object
-      required: [model, protocol, available, inputPerMillion, cachedInputPerMillion, outputPerMillion, perRequest, longContextThreshold, longContextMultiplier, peakMultiplier]
+      required: [model, protocol, available, inputPerMillion, cachedInputPerMillion, outputPerMillion, perRequest, perSecond, mediaOptions, longContextThreshold, longContextMultiplier, peakMultiplier]
       properties:
         model: { type: string }
-        protocol: { enum: [OPENAI, OPENAI_CHAT, ANTHROPIC, GEMINI, IMAGES] }
+        protocol: { enum: [OPENAI, OPENAI_CHAT, ANTHROPIC, GEMINI, IMAGES, VIDEOS] }
         available: { type: boolean, description: The model appeared in a currently verified catalog for the package. }
         inputPerMillion: { type: string }
         cachedInputPerMillion: { type: string }
         outputPerMillion: { type: string }
         perRequest: { type: string }
+        perSecond: { type: string, description: Price per completed video second in USDT. }
+        mediaOptions:
+          type: object
+          additionalProperties: { type: array, items: { type: [string, number, boolean] } }
+          description: Allowed explicitly priced parameters. Video durations are seconds; edits require operations containing edit.
         longContextThreshold: { type: [integer, 'null'] }
         longContextMultiplier: { type: string }
         peakMultiplier: { type: string, description: 'Multiplier for token charges on weekdays 01:00–04:00 and 06:00–10:00 UTC.' }
@@ -1188,7 +1521,7 @@ components:
       properties:
         id: { type: string, format: uuid }
         status: { enum: [PENDING, PAID, FULFILLED, FAILED, EXPIRED, REFUNDED] }
-        paymentProvider: { enum: [yookassa, nowpayments, mock, stripe], description: Stripe is supported only for historical orders. }
+        paymentProvider: { enum: [yookassa, nowpayments, ton, mock, stripe], description: Stripe is supported only for historical orders. }
         amount: { type: string, description: Amount charged in the payment currency. }
         currency: { type: string, description: RUB or USDT for new orders; original currency for historical orders. }
         creditAmount: { type: string, description: USDT credited exactly once after payment confirmation. }
@@ -1246,6 +1579,7 @@ components:
         cacheWrite5mTokens: { type: string }
         cacheWrite1hTokens: { type: string }
         imageCount: { type: integer }
+        videoSeconds: { type: integer }
         cost: { type: string, description: USDT charged from the key's allowance. }
         status: { enum: [STARTED, SUCCEEDED, FAILED, CANCELLED] }
         httpStatus: { type: [integer, 'null'] }
@@ -1261,6 +1595,6 @@ components:
         baseUrl: { type: string, format: uri, description: A trailing /v1 or /v1beta is normalized automatically. }
         credentialCapacity: { type: integer, minimum: 1, description: Sold customer keys per upstream credential }
         parentPoolId: { type: [string, 'null'], format: uuid, description: Optional standalone pool that shares this channel with its packages. }
-        protocol: { enum: [OPENAI, OPENAI_CHAT, ANTHROPIC, GEMINI, IMAGES], default: OPENAI }
+        protocol: { enum: [OPENAI, OPENAI_CHAT, ANTHROPIC, GEMINI, IMAGES, VIDEOS], default: OPENAI }
         routingPriority: { type: integer, minimum: 0, maximum: 10000, default: 0 }
         active: { type: boolean, default: true }

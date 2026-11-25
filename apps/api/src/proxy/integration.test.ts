@@ -336,7 +336,7 @@ integration('purchase allocation and OpenAI-compatible proxy', () => {
     expect(catalog.json().data.map((entry: { id: string }) => entry.id)).toEqual(['cheap-model', 'image-model', 'integration-model', 'other-model']);
     expect(catalog.json().data.every((entry: { owned_by: string }) => entry.owned_by === 'unknown')).toBe(true);
     const before = seenInference.length;
-    for (const url of ['/v1/responses/resp_foreign', '/v1/responses/%2e%2e/secret', '/v1/images/edits']) {
+    for (const url of ['/v1/responses/resp_foreign', '/v1/responses/%2e%2e/secret']) {
       const res = await app.inject({ method: 'POST', url, headers: auth(), payload: { model: 'integration-model' } });
       expect(res.statusCode).toBe(404);
     }

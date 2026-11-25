@@ -9,29 +9,38 @@ const methods = new Map([
   ['/v1/responses/compact', 'POST'],
   ['/v1/chat/completions', 'POST'],
   ['/v1/images/generations', 'POST'],
+  ['/v1/images/edits', 'POST'],
+  ['/v1/videos', 'POST'],
   ['/v1/messages', 'POST'],
+  ['/v1/messages/count_tokens', 'POST'],
   ['/v1beta/models', 'GET'],
+  ['/v1/models/:model', 'GET'],
+  ['/v1beta/models/:model', 'GET'],
   ['/v1beta/generateContent', 'POST'],
   ['/v1beta/streamGenerateContent', 'POST'],
+  ['/v1beta/countTokens', 'POST'],
 ]);
 
 function geminiRoute(path: string) {
-  return /^\/v1beta\/models\/([A-Za-z0-9_.-]{1,200}):(generateContent|streamGenerateContent)$/.exec(path);
+  return /^\/v1(?:beta)?\/models\/([A-Za-z0-9_.-]{1,200}):(generateContent|streamGenerateContent|countTokens)$/.exec(path);
 }
 
 export function enabledEndpoint(request: FastifyRequest): string {
   const [url, ...queryParts] = request.url.split('?');
   const query = queryParts.length ? queryParts.join('?') : undefined;
   const gemini = geminiRoute(url!);
-  const path = gemini ? `/v1beta/${gemini[2]}` : url!;
+  const model = /^\/(v1|v1beta)\/models\/([A-Za-z0-9_.-]{1,200})$/.exec(url!);
+  const path = gemini ? `/v1beta/${gemini[2]}` : model ? `/${model[1]}/models/:model` : url!;
   const enabled = config.proxyAllowedPaths.includes(path)
+    || (model && config.proxyAllowedPaths.includes(`/${model[1]}/models`))
     || (path === '/v1/images/generations' && config.proxyAllowedPaths.includes('/v1/images'));
-  if (!methods.has(path) || !enabled || (!gemini && path.startsWith('/v1beta/') && path !== '/v1beta/models')) {
+  if (!methods.has(path) || !enabled || (!gemini && path.startsWith('/v1beta/') && !path.startsWith('/v1beta/models'))) {
     throw new AppError(404, 'ENDPOINT_NOT_ALLOWED', 'This API endpoint is not enabled');
   }
   if (methods.get(path) !== request.method) throw new AppError(405, 'METHOD_NOT_ALLOWED', 'This HTTP method is not enabled for the endpoint');
   if (query !== undefined && path !== '/v1/models' && !(path === '/v1beta/streamGenerateContent' && query === 'alt=sse')
-    && !(path === '/v1/messages' && query === 'beta=true')) {
+    && !(path.startsWith('/v1/messages') && query === 'beta=true')
+    && !(path === '/v1beta/models' && query.split('&').every(part => /^(pageSize=\d{1,4}|pageToken=[A-Za-z0-9_.-]+)$/.test(part)))) {
     throw new AppError(400, 'QUERY_NOT_SUPPORTED', 'Use the JSON request body instead of query parameters');
   }
   return path;
@@ -42,7 +51,7 @@ function scopedId(keyId: string, value: string): string {
   return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-4${digest.slice(13, 16)}-a${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
 }
 
-const cacheHeaders = ['session_id', 'session-id', 'x-session-id', 'prompt_cache_key', 'x-prompt-cache-key'];
+const cacheHeaders = ['session_id', 'session-id', 'x-session-id', 'prompt_cache_key', 'x-prompt-cache-key', 'x-grok-conv-id'];
 
 export function upstreamHeaders(request: FastifyRequest, keyId: string, upstreamKey: string, requestId: string): Headers {
   const headers = new Headers({ authorization: `Bearer ${upstreamKey}`, 'content-type': 'application/json', 'x-proxy-request-id': requestId });
@@ -58,7 +67,7 @@ export function upstreamHeaders(request: FastifyRequest, keyId: string, upstream
 }
 
 export function nativeHeaders(headers: Headers, request: FastifyRequest, endpoint: string, secret: string) {
-  if (endpoint === '/v1/messages') {
+  if (endpoint.startsWith('/v1/messages')) {
     const version = request.headers['anthropic-version'];
     headers.set('x-api-key', secret);
     headers.set('anthropic-version', typeof version === 'string' ? version : '2023-06-01');
@@ -80,16 +89,41 @@ function boundedInt(value: unknown, name: string, maximum: number, fallback: num
   return value;
 }
 
-export function prepareInference(request: FastifyRequest, endpoint: string, keyId: string) {
+export interface PreparedInference {
+  model: string;
+  buffer: Buffer;
+  upstreamPath: string;
+  outputBudget: number;
+  images: number;
+  cacheWrite: boolean;
+  countOnly: boolean;
+  contentType: string;
+  videoSeconds?: number;
+  media?: Record<string, unknown>;
+  inputHash?: string;
+}
+
+export function prepareInference(request: FastifyRequest, endpoint: string, keyId: string): PreparedInference {
   if (request.headers['content-type']?.split(';')[0]?.trim().toLowerCase() !== 'application/json'
     || !request.body || typeof request.body !== 'object' || Array.isArray(request.body) || Buffer.isBuffer(request.body)) {
     throw new AppError(415, 'JSON_REQUIRED', 'This endpoint requires a JSON object');
   }
   const json = { ...request.body } as Record<string, unknown>;
   const gemini = geminiRoute(request.url.split('?', 1)[0]!);
-  const isAnthropic = endpoint === '/v1/messages';
+  const isAnthropic = endpoint.startsWith('/v1/messages');
+  const countOnly = endpoint.endsWith('/count_tokens') || endpoint.endsWith('/countTokens');
   const model = gemini?.[1] ?? json.model;
   if (typeof model !== 'string' || !model.trim() || model.length > 200) throw new AppError(400, 'MODEL_REQUIRED', 'A model is required for this endpoint');
+  if (gemini && countOnly && json.generateContentRequest != null) {
+    const nested = json.generateContentRequest;
+    if (!nested || typeof nested !== 'object' || Array.isArray(nested)) throw new AppError(400, 'INVALID_REQUEST', 'generateContentRequest must be an object');
+    const contents = nested as Record<string, unknown>;
+    if (contents.model !== undefined && contents.model !== model && contents.model !== `models/${model}`) {
+      throw new AppError(400, 'MODEL_MISMATCH', 'The counted model must match the URL');
+    }
+    assertStatelessInputs(contents);
+    if (contents.cachedContent != null || contents.cached_content != null) throw new AppError(400, 'STORED_RESOURCE_NOT_SUPPORTED', 'Use inline content');
+  }
 
   const isImage = endpoint === '/v1/images/generations';
   const isChat = endpoint === '/v1/chat/completions';
@@ -156,7 +190,7 @@ export function prepareInference(request: FastifyRequest, endpoint: string, keyI
   }
   const candidates = isChat ? boundedInt(json.n, 'n', 8, 1)
     : gemini ? boundedInt(options.candidateCount ?? options.candidate_count, 'candidateCount', 8, 1) : 1;
-  const outputBudget = isImage ? 0 : (gemini
+  const outputBudget = isImage || countOnly ? 0 : (gemini
     ? geminiOutputBudget(options, outputCeiling)
     : isAnthropic ? boundedInt(json.max_tokens, 'max_tokens', outputCeiling, outputCeiling)
     : isChat
@@ -166,7 +200,7 @@ export function prepareInference(request: FastifyRequest, endpoint: string, keyI
   const images = isImage ? boundedInt(json.n, 'n', 10, 1) : 0;
   const upstreamPath = gemini ? `/v1beta/models/${model}:${gemini[2]}${endpoint.endsWith('/streamGenerateContent') ? '?alt=sse' : ''}`
     : isAnthropic && request.url.endsWith('?beta=true') ? `${endpoint}?beta=true` : endpoint;
-  return { model, images, outputBudget, cacheWrite, upstreamPath, buffer: Buffer.from(JSON.stringify(json)) };
+  return { model, images, outputBudget, cacheWrite, countOnly, contentType: 'application/json', upstreamPath, buffer: Buffer.from(JSON.stringify(json)) };
 }
 
 function geminiOutputBudget(options: Record<string, unknown>, maximum: number): number {

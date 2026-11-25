@@ -13,7 +13,7 @@ import { config } from '../config.js';
 const scrypt = promisify(scryptCallback);
 const encryptionKey = Buffer.from(config.KEY_ENCRYPTION_SECRET, 'hex');
 
-export function sha256(value: string): string {
+export function sha256(value: string | Uint8Array): string {
   return createHash('sha256').update(value).digest('hex');
 }
 

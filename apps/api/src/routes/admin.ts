@@ -1,16 +1,19 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
+import { Decimal } from 'decimal.js';
 import { requireAdmin } from '../auth/session.js';
 import { config } from '../config.js';
 import { sql } from '../db/index.js';
 import { encryptSecret, keyHint, upstreamKeyFingerprint } from '../lib/crypto.js';
 import { AppError, assertFound } from '../lib/errors.js';
 import { protocols } from '../proxy/protocols.js';
+import { adminVideoRoutes } from '../proxy/videos.js';
 import { isDuplicateUpstreamKey, refreshUpstreamCatalog } from '../services/upstream-catalog.js';
 import { updateUserAccess } from '../services/user-access.js';
 import { providerBalanceStatus } from '../services/provider-balances.js';
 import { listProviderKeys, listUserKeys, requestProviderKeyRefresh } from '../services/provider-keys.js';
 import type { AuthenticatedRequest } from '../types.js';
+import { inspectTonTransaction, reviewTonPayment, tonPaymentOverview } from '../services/ton-payments.js';
 
 const poolSchema = z.object({
   name: z.string().trim().min(2).max(100),
@@ -63,6 +66,9 @@ const rateSchema = z.object({
   outputPerMillion: z.string().regex(/^\d+(?:\.\d+)?$/),
   cachedInputPerMillion: z.string().regex(/^\d+(?:\.\d+)?$/),
   perRequest: z.string().regex(/^\d+(?:\.\d+)?$/).default('0'),
+  perSecond: z.string().regex(/^\d+(?:\.\d+)?$/).default('0'),
+  mediaOptions: z.record(z.string().regex(/^(seconds|size|quality|background|input_fidelity|resolution|aspect_ratio|audio|operations)$/),
+    z.array(z.union([z.string().min(1).max(100), z.number().finite(), z.boolean()])).min(1).max(30)).default({}),
   longContextThreshold: z.number().int().positive().nullable().default(null),
   longContextMultiplier: z.string().regex(/^\d+(?:\.\d+)?$/).default('1'),
   peakMultiplier: z.number().min(1).max(10).optional(),
@@ -80,6 +86,22 @@ async function audit(request: FastifyRequest, action: string, entityType: string
 
 export async function adminRoutes(app: FastifyInstance): Promise<void> {
   app.addHook('preHandler', requireAdmin);
+  await adminVideoRoutes(app);
+
+  app.get('/api/admin/payments/ton', tonPaymentOverview);
+  app.post('/api/admin/payments/ton/inspect', async request => {
+    const body = z.object({ orderId: z.string().uuid(), transactionHash: z.string().trim().min(43).max(64) }).parse(request.body);
+    await inspectTonTransaction(body.orderId, body.transactionHash);
+    await audit(request, 'INSPECT_PAYMENT', 'ORDER', body.orderId);
+    return { verified: true };
+  });
+  app.post('/api/admin/payments/ton/:id/review', async request => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const body = z.object({ decision: z.enum(['approve', 'reject']), orderId: z.string().uuid().optional(),
+      note: z.string().trim().min(10).max(1000) }).parse(request.body);
+    await reviewTonPayment({ ...body, id, actorId: (request as AuthenticatedRequest).authUser.id });
+    return { reviewed: true };
+  });
 
   app.get('/api/admin/provider-keys', request => listProviderKeys(keyListQuery.parse(request.query)));
 
@@ -107,12 +129,23 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
         (SELECT count(*)::int FROM users) AS users,
         (SELECT count(*)::int FROM api_keys WHERE status = 'ACTIVE') AS active_keys,
         (SELECT count(*)::int FROM upstream_credentials WHERE status IN ('ACTIVE', 'DEGRADED')) AS upstream_keys,
-        (SELECT COALESCE(sum(COALESCE(credit_amount, amount)), 0)::text FROM orders WHERE status = 'FULFILLED') AS gross_revenue,
-        (SELECT COALESCE(sum(cost), 0)::text FROM usage_records) AS wholesale_cost,
+        (SELECT COALESCE(sum(COALESCE(credit_amount, amount)), 0)::text FROM orders WHERE status IN ('PAID', 'FULFILLED')
+          AND payment_provider <> 'mock' AND COALESCE(metadata->>'testPayment', 'false') <> 'true') AS gross_revenue,
+        (SELECT COALESCE(sum(ur.cost), 0)::text FROM usage_records ur JOIN api_keys ak ON ak.id = ur.api_key_id
+          JOIN orders o ON o.id = ak.order_id WHERE o.payment_provider <> 'mock' AND COALESCE(o.metadata->>'testPayment', 'false') <> 'true') AS wholesale_cost,
+        (SELECT COALESCE(sum(ur.retail_cost), 0)::text FROM usage_records ur JOIN api_keys ak ON ak.id = ur.api_key_id
+          JOIN orders o ON o.id = ak.order_id WHERE o.payment_provider <> 'mock' AND COALESCE(o.metadata->>'testPayment', 'false') <> 'true') AS usage_revenue,
+        (SELECT count(*)::int FROM usage_records WHERE error_code LIKE '%UNCONFIRMED%' OR status = 'STARTED') AS unsettled_usage,
         (SELECT count(*)::int FROM orders WHERE status = 'PENDING') AS pending_orders,
         (SELECT count(*)::int FROM orders WHERE status = 'PAID') AS paid_orders
     `;
-    return { stats };
+    const usageRevenue = new Decimal(String(stats?.usageRevenue ?? 0));
+    const wholesaleUsdt = new Decimal(String(stats?.wholesaleCost ?? 0)).mul(config.BILLING_USDT_PER_USD);
+    const markup = new Decimal(config.PRICE_MARKUP);
+    return { stats: { ...stats, usageGrossProfit: usageRevenue.sub(wholesaleUsdt).toFixed(8) },
+      economics: { markup: markup.toString(), grossMarginPercent: new Decimal(1).sub(new Decimal(1).div(markup)).mul(100).toFixed(2),
+        exampleRevenue: '20', exampleCost: new Decimal(20).div(markup).toFixed(2),
+        exampleGrossProfit: new Decimal(20).sub(new Decimal(20).div(markup)).toFixed(2) } };
   });
 
   app.get('/api/admin/pools', async () => {
@@ -290,7 +323,7 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
   app.get('/api/admin/rates', async () => {
     const rates = await sql<Record<string, unknown>[]>`
       SELECT mr.id, mr.pool_id, up.name AS provider_name, mr.model, mr.input_per_million::text,
-        mr.output_per_million::text, mr.cached_input_per_million::text, mr.per_request::text,
+        mr.output_per_million::text, mr.cached_input_per_million::text, mr.per_request::text, mr.per_second::text, mr.media_options,
         mr.long_context_threshold::int, mr.long_context_multiplier::text, mr.peak_multiplier::text,
         mr.active, mr.updated_at
       FROM model_rates mr JOIN upstream_pools up ON up.id = mr.pool_id
@@ -301,19 +334,28 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
 
   app.post('/api/admin/rates', async (request) => {
     const body = rateSchema.parse(request.body);
+    const [pool] = await sql<{ protocol: string }[]>`SELECT protocol FROM upstream_pools WHERE id = ${body.poolId}`;
+    if (pool?.protocol === 'VIDEOS' && body.active && (Number(body.perSecond) <= 0 || !body.mediaOptions.seconds?.length
+      || body.mediaOptions.seconds.some(value => typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 120)
+      || [body.inputPerMillion, body.outputPerMillion, body.cachedInputPerMillion, body.perRequest].some(value => Number(value) !== 0))) {
+      throw new AppError(400, 'INVALID_VIDEO_RATE', 'Set a positive per-second price, allowed durations (1–120 seconds), and zero token/per-request rates');
+    }
+    if (pool?.protocol !== 'VIDEOS' && Number(body.perSecond) !== 0) throw new AppError(400, 'INVALID_VIDEO_RATE', 'Per-second pricing requires a VIDEOS provider');
     const [rate] = await sql<{ id: string }[]>`
       INSERT INTO model_rates (
         pool_id, model, input_per_million, output_per_million, cached_input_per_million, per_request,
-        long_context_threshold, long_context_multiplier, peak_multiplier, active
+        long_context_threshold, long_context_multiplier, peak_multiplier, active, per_second, media_options
       ) VALUES (
         ${body.poolId}, ${body.model}, ${body.inputPerMillion}, ${body.outputPerMillion},
         ${body.cachedInputPerMillion}, ${body.perRequest}, ${body.longContextThreshold},
-        ${body.longContextMultiplier}, ${body.peakMultiplier ?? 1}, ${body.active}
+        ${body.longContextMultiplier}, ${body.peakMultiplier ?? 1}, ${body.active}, ${body.perSecond}, ${sql.json(body.mediaOptions)}
       ) ON CONFLICT (pool_id, model) DO UPDATE SET
         input_per_million = EXCLUDED.input_per_million,
         output_per_million = EXCLUDED.output_per_million,
         cached_input_per_million = EXCLUDED.cached_input_per_million,
         per_request = EXCLUDED.per_request,
+        per_second = EXCLUDED.per_second,
+        media_options = EXCLUDED.media_options,
         long_context_threshold = EXCLUDED.long_context_threshold,
         long_context_multiplier = EXCLUDED.long_context_multiplier,
         peak_multiplier = COALESCE(${body.peakMultiplier ?? null}, model_rates.peak_multiplier),
