@@ -27,16 +27,28 @@ API: Responses/Chat Completions для GPT, Grok и совместимых мо�
 
 ## Быстрый запуск
 
-Нужны Node.js 24.22.3+ (ветка 24 LTS), Colima, Docker CLI и Docker Compose.
+Для локального полного стека нужны Colima, Docker CLI и актуальный Docker Compose. Приложение собирается и работает на Node.js 24.22.3 внутри Docker; команда запуска совместима с установленным на хосте Node.js 20. Для разработки через `npm run dev`, сборки и запуска API вне Docker нужен Node.js 24.22.3+.
 
 ```bash
-cp .env.example .env
-# Замените пароли и два секрета в .env перед первым запуском.
+# Только если .env ещё не создан: cp .env.example .env
+# Существующий .env с реквизитами не перезаписывайте.
 colima start --cpu 4 --memory 8 --disk 60
-docker-compose up -d --build
+npm start
 docker-compose ps
 curl http://localhost:8080/health/ready
 ```
+
+`npm start` поднимает весь локальный стек через `docker-compose.yml` + `docker-compose.local.yml`: сайт, API, worker, PostgreSQL и мониторинг. Явный локальный профиль использует HTTP на `127.0.0.1`, закрывает продажи и отключает mock-оплату. Корневой `.env`, TON-реквизиты, пароль БД и ключ шифрования сохраняются. Все существующие данные остаются в тех же Docker volumes. Production-проверки в основном Compose-файле не ослабляются.
+
+Остановка всего локального стека: `npm stop`. Диагностика ошибки запуска: `npm run local:logs`. Эквивалент ручного запуска:
+
+```bash
+docker-compose -f docker-compose.yml -f docker-compose.local.yml up -d --build --wait
+```
+
+Обычный `docker-compose up -d --build` применяет настройки `.env` без локального профиля. При `NODE_ENV=production` он требует реальный HTTPS-домен и безопасные production-секреты; незаполненная production-конфигурация должна завершаться ошибкой, в том числе на этапе `migrate`.
+
+`npm run start:api` запускает только предварительно собранный API вне Docker. API читает корневой `.env` независимо от рабочей папки npm workspace; переменные окружения имеют приоритет. Для отдельного host-конфига можно задать `DOTENV_CONFIG_PATH=/абсолютный/путь/.env.host`: в нём нужен доступный с хоста `DATABASE_URL` (например, хост `127.0.0.1` и опубликованный порт PostgreSQL), а не Docker-имя `postgres`.
 
 Откройте [Ksapi](http://localhost:8080) и [публичную документацию](http://localhost:8080/docs). Начальный администратор берётся из `ADMIN_EMAIL` и `ADMIN_PASSWORD`. Добавляйте CE API keys в **Админка → Провайдеры → Добавить upstream-ключ** и выбирайте канал, соответствующий группе каждого ключа. Секреты хранятся в PostgreSQL в зашифрованном виде.
 

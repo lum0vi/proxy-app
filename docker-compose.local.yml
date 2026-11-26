@@ -1,0 +1,24 @@
+# Explicit localhost profile. Production uses docker-compose.yml on its own.
+# Keep the same project/volumes so starting locally never resets existing data.
+x-local-environment: &local-environment
+  NODE_ENV: development
+  PUBLIC_APP_URL: http://localhost:${APP_PORT:-8080}
+  SALES_ENABLED: "false"
+  ALLOW_MOCK_PAYMENTS: "false"
+
+services:
+  migrate:
+    environment:
+      <<: *local-environment
+  api:
+    environment:
+      <<: *local-environment
+  worker:
+    environment:
+      <<: *local-environment
+  nginx:
+    ports: !override
+      - "127.0.0.1:${APP_PORT:-8080}:80"
+  grafana:
+    environment:
+      GF_SERVER_ROOT_URL: http://localhost:${APP_PORT:-8080}/grafana/

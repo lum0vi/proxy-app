@@ -18,7 +18,12 @@
     "test:coverage": "npm run test:coverage --workspace @proxi/api && npm run test:coverage --workspace @proxi/web",
     "db:migrate": "npm run db:migrate --workspace @proxi/api",
     "db:seed": "npm run db:seed --workspace @proxi/api",
-    "start": "npm run start --workspace @proxi/api"
+    "start": "npm run local:up",
+    "stop": "npm run local:stop",
+    "local:up": "node scripts/local-stack.mjs up",
+    "local:stop": "node scripts/local-stack.mjs stop",
+    "local:logs": "node scripts/local-stack.mjs logs",
+    "start:api": "npm run start --workspace @proxi/api"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",

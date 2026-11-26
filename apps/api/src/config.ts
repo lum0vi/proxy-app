@@ -1,7 +1,9 @@
-import 'dotenv/config';
 import { z } from 'zod';
 import { tonAddress } from './lib/ton.js';
 import { browserOrigins } from './lib/browser-origins.js';
+import { loadEnvironment } from './lib/environment.js';
+
+loadEnvironment();
 
 const envBoolean = z
   .union([z.boolean(), z.enum(['true', 'false'])])
