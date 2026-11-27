@@ -12,9 +12,18 @@ async function main() {
   };
   check(config.NODE_ENV === 'production', 'NODE_ENV=production');
   check(!config.ALLOW_MOCK_PAYMENTS && !config.paymentMethods.includes('mock'), 'Mock payments disabled');
-  check(config.paymentMethods.length === 1 && config.paymentMethods[0] === 'nowpayments'
-    && config.paymentCurrencies.length === 1 && config.paymentCurrencies[0] === 'USDT', 'Crypto-only checkout: NOWPayments / USDT TON');
-  check(Boolean(config.NOWPAYMENTS_API_KEY && config.NOWPAYMENTS_IPN_SECRET), 'Payment API key and webhook secret configured');
+  check(config.paymentMethods.length > 0 && config.paymentMethods.every(method => ['ton', 'nowpayments'].includes(method))
+    && config.paymentCurrencies.length === 1 && config.paymentCurrencies[0] === 'USDT', 'Crypto-only checkout: USDT TON');
+  if (config.paymentMethods.includes('ton')) {
+    check(Boolean(config.TON_RECEIVER_ADDRESS && config.TONCENTER_API_KEY), 'Direct TON wallet and indexer API key configured');
+    const [scan] = await sql<{ healthy: boolean }[]>`SELECT count(*) > 0 AND bool_and(error_code IS NULL
+      AND checked_at > now() - interval '3 minutes' AND scanned_through > now() - interval '10 minutes') AS healthy FROM ton_payment_scans`;
+    check(scan?.healthy === true, 'TON worker has a fresh, successful blockchain scan');
+    const [review] = await sql<{ count: number }[]>`SELECT count(*)::int AS count FROM ton_payments WHERE status = 'REVIEW'`;
+    check((review?.count ?? 0) === 0, 'No unresolved USDT transfers');
+    console.info(`INFO TON payment approval: ${config.TON_AUTO_APPROVE ? 'automatic exact-match payments' : 'manual administrator review'}`);
+  }
+  if (config.paymentMethods.includes('nowpayments')) check(Boolean(config.NOWPAYMENTS_API_KEY && config.NOWPAYMENTS_IPN_SECRET), 'NOWPayments API key and webhook secret configured');
   const url = new URL(config.PUBLIC_APP_URL);
   check(url.protocol === 'https:' && url.pathname === '/' && !url.search && !url.hash
     && !/^(localhost|127\.|0\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(url.hostname)

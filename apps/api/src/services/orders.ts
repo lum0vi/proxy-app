@@ -102,7 +102,7 @@ export async function createOrder(input: {
     throw new AppError(400, 'PAYMENT_CURRENCY_DISABLED', 'The selected payment currency is not enabled');
   }
   if ((input.paymentProvider === 'yookassa' && currency !== 'RUB')
-    || (input.paymentProvider === 'nowpayments' && currency !== 'USDT')) {
+    || (['nowpayments', 'ton'].includes(input.paymentProvider) && currency !== 'USDT')) {
     throw new AppError(400, 'INVALID_PAYMENT_CURRENCY', 'The selected payment method does not support this currency');
   }
   const rubRate = currency === 'RUB' ? await requireRubRate() : null;
@@ -135,7 +135,8 @@ export async function createOrder(input: {
       ...(key && { apiKeyId: key.id, preferredCredentialId: key.upstreamCredentialId, minimumBudget: topUpBudget(key, creditAmount) }),
     });
     const productName = key ? `API key top-up · ${product.name}` : product.name;
-    const reservationMinutes = input.paymentProvider === 'yookassa' ? 60 : input.paymentProvider === 'nowpayments' ? 25 : 1440;
+    const reservationMinutes = input.paymentProvider === 'ton' ? config.TON_INVOICE_TTL_MINUTES
+      : input.paymentProvider === 'yookassa' ? 60 : input.paymentProvider === 'nowpayments' ? 25 : 1440;
     const reservedUntil = new Date(Math.floor(Date.now() / 1000) * 1000 + reservationMinutes * 60_000);
     const rows = await transaction<Omit<CreatedOrder, 'productName'>[]>`
       INSERT INTO orders (

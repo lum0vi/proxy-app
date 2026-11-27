@@ -10,7 +10,7 @@ const clients = [
   { id: 'claude', name: 'Claude Code', note: 'Anthropic Messages', icon: MessageSquareCode, file: '~/.claude/settings.json' },
   { id: 'opencode', name: 'OpenCode', note: 'OpenCode 2', icon: Code2, file: '~/.config/opencode/opencode.json' },
   { id: 'curl', name: 'curl', note: 'HTTP / SSE', icon: Terminal, file: 'Terminal' },
-  { id: 'node', name: 'Node.js', note: 'OpenAI SDK', icon: Braces, file: 'index.ts' },
+  { id: 'node', name: 'Node.js', note: 'OpenAI / Anthropic / Google SDK', icon: Braces, file: 'index.ts' },
 ] as const;
 
 const instructions = {
@@ -25,8 +25,8 @@ function accepts(client: (typeof clients)[number]['id'], protocol: Protocol) {
   switch (client) {
     case 'codex': return protocol === 'OPENAI';
     case 'claude': return protocol === 'ANTHROPIC';
-    case 'opencode': return protocol !== 'IMAGES';
-    case 'node': return protocol !== 'ANTHROPIC' && protocol !== 'GEMINI';
+    case 'opencode': return protocol !== 'IMAGES' && protocol !== 'VIDEOS';
+    case 'node': return true;
     case 'curl': return true;
   }
 }
@@ -44,7 +44,7 @@ export function ClientSetup({ models = [] }: { models?: ModelOption[] }) {
   const optionId = (choice: ModelOption) => `${choice.protocol}/${choice.model}`;
   const model = choices.find((choice) => optionId(choice) === selectedModel)
     ?? choices.find((choice) => choice.model === defaultModel) ?? choices[0]!;
-  const snippets = connectionSnippets(window.location.origin, model.model, model.protocol);
+  const snippets = connectionSnippets(window.location.origin, model.model, model.protocol, model.mediaOptions);
   const exportKey = system === 'posix' ? `export KSAPI_API_KEY="${exampleKey}"` : `$env:KSAPI_API_KEY = "${exampleKey}"`;
   let code = snippets[client.id];
   if (client.id === 'curl' && system === 'powershell') {
@@ -67,7 +67,8 @@ export function ClientSetup({ models = [] }: { models?: ModelOption[] }) {
           {choices.map((choice) => <option key={optionId(choice)} value={optionId(choice)}>{choice.model}</option>)}
         </select></label>
       </div>
-      <p>{instructions[client.id][ru ? 0 : 1]}</p>
+      <p>{client.id === 'node' ? `${ru ? 'Установите' : 'Install'} ${model.protocol === 'ANTHROPIC' ? '@anthropic-ai/sdk' : model.protocol === 'GEMINI' ? '@google/genai' : 'openai'} · npm install ${model.protocol === 'ANTHROPIC' ? '@anthropic-ai/sdk' : model.protocol === 'GEMINI' ? '@google/genai' : 'openai'}` : instructions[client.id][ru ? 0 : 1]}</p>
+      {model.protocol === 'VIDEOS' && <p className="form-hint">{ru ? 'Укажите длительность и разрешение из тарифа модели. Сохраните ID задачи; повторная проверка статуса и скачивание не списывают баланс.' : 'Use a duration and size included in the model rate. Save the job ID; polling and downloads do not charge the balance.'}</p>}
       {client.id !== 'claude' && <CodeBlock code={exportKey} label={ru ? 'Подставьте свой API-ключ' : 'Insert your API key'}/>}
       <CodeBlock code={code} label={client.file}/>
     </div>

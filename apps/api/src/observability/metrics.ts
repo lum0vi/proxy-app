@@ -99,6 +99,12 @@ const pendingOrders = new Gauge({
   labelNames: ['status'] as const,
   registers: [metricsRegistry],
 });
+const tonMonitoring = new Gauge({ name: 'proxiapp_ton_monitor_enabled', help: 'Direct TON payment monitoring enabled', registers: [metricsRegistry] });
+const tonScanLag = new Gauge({ name: 'proxiapp_ton_scan_lag_seconds', help: 'Oldest TON scan watermark lag; 86400 when not started', registers: [metricsRegistry] });
+const tonScanErrors = new Gauge({ name: 'proxiapp_ton_scan_errors', help: 'Wallet scans with an indexer error', registers: [metricsRegistry] });
+const tonReviewCount = new Gauge({ name: 'proxiapp_ton_payments_review', help: 'Finalized USDT deposits awaiting manual resolution', registers: [metricsRegistry] });
+const videoJobs = new Gauge({ name: 'proxiapp_video_jobs', help: 'Durable video jobs by state', labelNames: ['state'] as const, registers: [metricsRegistry] });
+const videoPollLag = new Gauge({ name: 'proxiapp_video_poll_lag_seconds', help: 'Oldest overdue video status check', registers: [metricsRegistry] });
 
 const providerBalance = new Gauge({ name: 'proxiapp_provider_account_balance_usd', help: 'Last confirmed provider account balance in USD',
   labelNames: ['provider'] as const, registers: [metricsRegistry] });
@@ -112,6 +118,17 @@ const providerBalanceMonitoring = new Gauge({ name: 'proxiapp_provider_account_b
   labelNames: ['provider'] as const, registers: [metricsRegistry] });
 
 async function refreshBusinessMetrics(): Promise<void> {
+  videoJobs.reset();
+  for (const row of await sql<{ state: string; count: number }[]>`SELECT state, count(*)::int AS count FROM video_jobs GROUP BY state`) videoJobs.set({ state: row.state }, row.count);
+  const [videoLag] = await sql<{ lag: number }[]>`SELECT GREATEST(0, COALESCE(extract(epoch FROM now() - min(poll_after)), 0))::float AS lag
+    FROM video_jobs WHERE state IN ('QUEUED','IN_PROGRESS')`;
+  videoPollLag.set(videoLag?.lag ?? 0);
+  tonMonitoring.set(Number(config.paymentMethods.includes('ton')));
+  const [ton] = await sql<{ lag: string; errors: number; review: number }[]>`SELECT
+    greatest(COALESCE((SELECT extract(epoch FROM now() - min(scanned_through)) FROM ton_payment_scans), 86400), 0)::text AS lag,
+    (SELECT count(*)::int FROM ton_payment_scans WHERE error_code IS NOT NULL) AS errors,
+    (SELECT count(*)::int FROM ton_payments WHERE status = 'REVIEW') AS review`;
+  tonScanLag.set(Number(ton?.lag ?? 86400)); tonScanErrors.set(ton?.errors ?? 0); tonReviewCount.set(ton?.review ?? 0);
   for (const gauge of [providerBalance, providerBalanceThreshold, providerBalanceChecked, providerBalanceHealthy, providerBalanceMonitoring]) gauge.reset();
   const ceLabels = { provider: ceBalanceProvider };
   providerBalanceMonitoring.set(ceLabels, Number(config.ceBalanceMonitorEnabled));

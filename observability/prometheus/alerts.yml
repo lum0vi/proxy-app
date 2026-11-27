@@ -79,3 +79,33 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: Review unconfirmed or unposted upstream usage for {{ $labels.provider }}
+      - alert: TonPaymentScannerStale
+        expr: (proxiapp_ton_scan_lag_seconds > 600 or proxiapp_ton_scan_errors > 0) and on() (proxiapp_ton_monitor_enabled == 1)
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "USDT TON payment verification is delayed or failing"
+          description: "Check the worker, TON Center API key and the payment desk before accepting more payments."
+      - alert: TonPaymentsNeedReview
+        expr: proxiapp_ton_payments_review > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "USDT transfers need administrator review"
+          description: "Open Admin → Orders to resolve unmatched, late, underpaid or overpaid transfers."
+      - alert: VideoJobsNeedReview
+        expr: proxiapp_video_jobs{state="REVIEW"} > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Video jobs have unconfirmed billing"
+          description: "Open Admin → Providers → Video jobs. Confirm the provider result or release the reservation."
+      - alert: VideoPollingStale
+        expr: proxiapp_video_poll_lag_seconds > 300
+        for: 3m
+        labels: { severity: warning }
+        annotations:
+          summary: "Video status checks are delayed"
+          description: "Check worker health and the video provider. Pending jobs retain their balance reservation."

@@ -107,7 +107,19 @@
       "targets": [{ "expr": "proxiapp_provider_account_balance_check_healthy", "legendFormat": "{{provider}}", "refId": "A" }],
       "fieldConfig": { "defaults": { "mappings": [{ "type": "value", "options": { "0": { "text": "UNKNOWN / STALE", "color": "red" }, "1": { "text": "CURRENT", "color": "green" } } }], "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] } }, "overrides": [] },
       "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
-    }
+    },
+    {
+      "type": "timeseries", "title": "USDT TON scan lag (seconds)", "id": 16, "gridPos": { "h": 8, "w": 12, "x": 0, "y": 44 },
+      "targets": [{ "expr": "proxiapp_ton_scan_lag_seconds and on() (proxiapp_ton_monitor_enabled == 1)", "legendFormat": "Scan lag", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+    },
+    {
+      "type": "timeseries", "title": "USDT transfers awaiting review", "id": 17, "gridPos": { "h": 8, "w": 12, "x": 12, "y": 44 },
+      "targets": [{ "expr": "proxiapp_ton_payments_review", "legendFormat": "Needs review", "refId": "A" }],
+      "fieldConfig": { "defaults": { "decimals": 0 }, "overrides": [] }
+    },
+    {"type": "timeseries","title": "Video jobs by state","id": 18,"gridPos": {"h": 8,"w": 12,"x": 0,"y": 52},"targets": [{"expr": "proxiapp_video_jobs","legendFormat": "{{state}}","refId": "A"}],"fieldConfig": {"defaults": {"decimals": 0},"overrides": []}},
+    {"type": "timeseries","title": "Video polling lag (seconds)","id": 19,"gridPos": {"h": 8,"w": 12,"x": 12,"y": 52},"targets": [{"expr": "proxiapp_video_poll_lag_seconds","legendFormat": "Poll lag","refId": "A"}],"fieldConfig": {"defaults": {"unit": "s"},"overrides": []}}
   ],
   "refresh": "15s",
   "schemaVersion": 40,
@@ -118,5 +130,5 @@
   "timezone": "browser",
   "title": "Ksapi / Service Overview",
   "uid": "proxiapp-overview",
-  "version": 1
+  "version": 2
 }

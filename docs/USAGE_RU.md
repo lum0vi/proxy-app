@@ -14,6 +14,8 @@
 
 ## 2. Подготовьте `.env`
 
+Этот шаг нужен для новой установки. Если `.env` и база уже существуют, сохраните текущие реквизиты и переходите к запуску: не копируйте шаблон поверх рабочего файла и не генерируйте новый ключ шифрования.
+
 ```bash
 cp .env.example .env
 openssl rand -hex 32
@@ -48,15 +50,17 @@ ALLOW_MOCK_PAYMENTS=true
 
 ```bash
 colima start --cpu 4 --memory 8 --disk 60
-docker-compose up -d --build
+npm start
 docker-compose ps
 curl -fsS http://localhost:8080/health/live
 curl -fsS http://localhost:8080/health/ready
 ```
 
-При первом старте `migrate` применит SQL-миграции, `seed` создаст каналы CE, три пакета, ставки моделей и первого администратора. Данные сохраняются в томах Docker. Если в старом `.env` вручную задан `PROXY_ALLOWED_PATHS`, добавьте пути Messages и Gemini из [.env.example](../.env.example).
+`npm start` использует основной Compose и `docker-compose.local.yml`: поднимает полный стек на localhost, выключает продажи и mock-оплату, сохраняя `.env` и данные. Требуемая версия Node.js работает внутри Docker; для самой команды достаточно установленного на хосте Node.js 20+. Остановка — `npm stop`, диагностика — `npm run local:logs`.
 
-После обновления кода также запускайте `docker-compose up -d --build`: обычный `up -d` может использовать старые образы, а `restart` не пересобирает код и не перечитывает `.env`. Например, ошибка `Invalid input: expected "USD"` при `DEFAULT_CURRENCY=USDT` означает, что стартовал образ до перехода на USDT. Пересборка обновляет приложение с сохранением тома PostgreSQL.
+При первом старте `migrate` применит SQL-миграции, `seed` создаст каналы CE, пакеты, ставки моделей и первого администратора. Данные сохраняются в томах Docker. Если в старом `.env` вручную задан `PROXY_ALLOWED_PATHS`, добавьте пути Messages и Gemini из [.env.example](../.env.example).
+
+После обновления кода повторите `npm start`. Эквивалент без npm: `docker-compose -f docker-compose.yml -f docker-compose.local.yml up -d --build --wait`. Обычный `docker-compose up -d --build` и следующие команды этой инструкции используют `.env` без локальных переопределений: при `NODE_ENV=production` обязательны HTTPS и production-секреты. `restart` не пересобирает код и не перечитывает окружение.
 
 Если сервис `migrate` завершился с кодом 1, причину можно прочитать командой `docker-compose logs --no-color --tail=100 migrate`. После успешного запуска его состояние `Exited (0)` нормально: миграции выполняются один раз, затем работают API и worker.
 
@@ -76,13 +80,14 @@ curl -fsS http://localhost:8080/health/ready
 Узнайте Wi-Fi IP Mac с приложением (`ipconfig getifaddr en0`). Например, для адреса `172.20.10.4` задайте в `.env`:
 
 ```dotenv
+NODE_ENV=development
 APP_BIND_ADDRESS=0.0.0.0
 APP_PORT=8080
 PUBLIC_APP_URL=http://172.20.10.4:8080
 ADDITIONAL_BROWSER_ORIGINS=http://localhost:8080,http://127.0.0.1:8080
 ```
 
-Примените `docker-compose up -d --build`. На втором компьютере откройте `PUBLIC_APP_URL`; на первом также разрешены перечисленные локальные адреса. Если macOS блокирует доступ, разрешите входящие подключения для процесса, публикующего порт Colima, в брандмауэре. При смене IP обновите `PUBLIC_APP_URL`.
+Примените `docker-compose up -d --build`. Для этого режима используется основной Compose: `npm start` ограничивает доступ одним Mac через localhost. На втором компьютере откройте `PUBLIC_APP_URL`; на первом также разрешены перечисленные локальные адреса. Если macOS блокирует доступ, разрешите входящие подключения для процесса, публикующего порт Colima, в брандмауэре. При смене IP обновите `PUBLIC_APP_URL`.
 
 `Request origin is not allowed` означает, что адрес открытой вкладки не входит в разрешённый список. Такая проверка выполняется до проверки пароля, например при показе ключа. Список используется и для CORS, и для защиты запросов с cookie. Указывайте только доверенные адреса самого приложения вместе со схемой и портом; пути, маски и произвольные сайты запрещены. В production дополнительные адреса должны использовать HTTPS. Для отдельного Vite dev-сервера можно явно добавить `http://localhost:5173`. Входить в аккаунт на разных адресах нужно отдельно, поскольку cookie привязаны к хосту.
 

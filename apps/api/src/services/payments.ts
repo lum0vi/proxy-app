@@ -4,8 +4,10 @@ import { config } from '../config.js';
 import { AppError } from '../lib/errors.js';
 import { Decimal } from 'decimal.js';
 import { createYooKassaCheckout } from './yookassa.js';
+import { USDT_TON_MASTER, tonAddress } from '../lib/ton.js';
+import { Address } from '@ton/core';
 
-export type PaymentProviderName = 'stripe' | 'nowpayments' | 'yookassa' | 'mock';
+export type PaymentProviderName = 'stripe' | 'nowpayments' | 'yookassa' | 'mock' | 'ton';
 
 export interface CheckoutOrder {
   id: string;
@@ -30,6 +32,19 @@ export async function createCheckout(
   order: CheckoutOrder,
 ): Promise<CheckoutResult> {
   if (provider === 'yookassa') return createYooKassaCheckout(order);
+  if (provider === 'ton') {
+    if (!config.TON_RECEIVER_ADDRESS) throw new AppError(503, 'PAYMENT_PROVIDER_UNAVAILABLE', 'TON payments are not configured');
+    if (order.currency !== 'USDT') throw new AppError(400, 'INVALID_CURRENCY', 'TON checkout requires USDT');
+    return {
+      externalId: `ton_${order.id}`,
+      checkoutUrl: `${config.PUBLIC_APP_URL}/dashboard/orders/${order.id}`,
+      expiresAt: order.reservedUntil,
+      metadata: { payAddress: Address.parse(config.TON_RECEIVER_ADDRESS).toString({ bounceable: false }), receiverRaw: tonAddress(config.TON_RECEIVER_ADDRESS),
+        payAmount: new Decimal(order.amount).toFixed(2), payCurrency: 'usdtton', network: 'TON', asset: 'USDT',
+        payinExtraId: `ks_${order.id.replaceAll('-', '')}`, master: USDT_TON_MASTER,
+        autoApprove: config.TON_AUTO_APPROVE },
+    };
+  }
   if (provider === 'mock') {
     if (!config.ALLOW_MOCK_PAYMENTS || config.NODE_ENV === 'production') {
       throw new AppError(400, 'PAYMENT_PROVIDER_DISABLED', 'Mock payments are disabled');

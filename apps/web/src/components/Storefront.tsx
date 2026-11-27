@@ -7,6 +7,9 @@ import { concurrentRequestSummary, money, type PriceRates, type Product, type St
 import { useRemote } from '../lib/useRemote';
 import { PriceCurrencies } from './PriceCurrencies';
 import { ModelCatalog, UsageEstimator } from './UsageEstimator';
+import { ChatGptComparison } from './ChatGptComparison';
+import { SupportSection } from './Support';
+import { ApiGatewayVisual, ApiShowcase } from './ApiShowcase';
 
 const faq = [
   ['Что входит в пакет?', 'Персональный API-ключ с балансом на сумму покупки. Один баланс используется для всех доступных моделей.', 'What comes with a package?', 'A personal API key with a balance equal to the purchase price. All available models use that balance.'],
@@ -66,13 +69,15 @@ export function Storefront() {
           <div className="store-hero-benefits"><span><KeyRound size={16}/>{ru ? 'Разовая оплата' : 'One-time purchase'}</span><span><BarChart3 size={16}/>{ru ? 'Учёт по запросам' : 'Per-request usage'}</span></div>
         </div>
         <div className="store-hero-visual">
-          <img src="/ksapi-gateway.jpg" width="1280" height="960" alt="" fetchPriority="high"/>
+          <ApiGatewayVisual/>
           <div className="store-api-panel"><span><i className={available ? 'ready' : ''}/>{catalog.loading ? (ru ? 'Проверяем доступ' : 'Checking access') : available ? (ru ? 'Ключи доступны' : 'Keys available') : (ru ? 'Покупка пока недоступна' : 'Purchases unavailable')}</span><code>POST /v1/responses</code></div>
         </div>
       </div>
     </section>
 
     <div className="shell-width store-content">
+      <ApiShowcase products={products}/>
+      <ChatGptComparison products={products}/>
       <section className="store-section" id="pricing">
         <div className="store-section-heading"><div><h2>{copy.keyPrice}</h2><p>{copy.packages}</p></div><Link to="/dashboard/usage">{ru ? 'Пополнить ключ' : 'Top up key'} <ArrowRight size={15}/></Link></div>
         {catalog.loading ? <p role="status" className="store-muted">{ru ? 'Загружаем пакеты…' : 'Loading packages…'}</p> : catalog.error
@@ -105,6 +110,7 @@ export function Storefront() {
         </details>)}
         <Link to={user ? '/dashboard' : '/register'}>{user ? (ru ? 'Открыть кабинет' : 'Open dashboard') : (ru ? 'Создать аккаунт' : 'Create an account')} <ArrowRight size={16}/></Link></div>
       </section>
+      <SupportSection/>
     </div>
   </main>;
 }
