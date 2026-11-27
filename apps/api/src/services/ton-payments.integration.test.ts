@@ -1,4 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto';
+import { Decimal } from 'decimal.js';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { buildApp } from '../app.js';
@@ -9,6 +10,7 @@ import { encryptSecret, sha256, upstreamKeyFingerprint } from '../lib/crypto.js'
 import { tonAddress, USDT_TON_MASTER } from '../lib/ton.js';
 import { selectCredentialWithCapacity } from './capacity.js';
 import { createOrder } from './orders.js';
+import { createCheckout } from './payments.js';
 import { scanTonPayments } from './ton-payments.js';
 
 const integration = process.env.RUN_INTEGRATION_TESTS === 'true' ? describe : describe.skip;
@@ -47,6 +49,15 @@ integration('direct USDT payments with real HTTP indexer and PostgreSQL', () => 
     payload: { decision, ...(orderId && { orderId }), note: 'Verified sending wallet ownership and on-chain receipt.' },
   });
   const receipt = async (orderId: string) => (await sql<{ id: string; status: string; reason: string }[]>`SELECT id, status, reason FROM ton_payments WHERE order_id = ${orderId}`)[0]!;
+
+  async function clearInvoices() {
+    await sql`DELETE FROM audit_logs WHERE actor_user_id = ${adminId}`;
+    await sql`DELETE FROM ton_payments WHERE receiver = ${receiver}`;
+    await sql`DELETE FROM ton_payment_scans WHERE address = ${receiver}`;
+    await sql`DELETE FROM orders WHERE user_id = ${userId} AND top_up_key_id IS NOT NULL`;
+    await sql`DELETE FROM api_keys WHERE user_id = ${userId}`;
+    await sql`DELETE FROM orders WHERE user_id = ${userId}`;
+  }
 
   beforeAll(async () => {
     indexer = Fastify();
@@ -93,19 +104,14 @@ integration('direct USDT payments with real HTTP indexer and PostgreSQL', () => 
   beforeEach(async () => {
     actions = []; available = true; nextPage = false; observedQueries.length = 0;
     Object.assign(config, { TON_AUTO_APPROVE: true });
-    await sql`DELETE FROM ton_payment_scans WHERE address = ${receiver}`;
+    await clearInvoices();
   });
   afterAll(async () => {
     vi.unstubAllGlobals();
     Object.assign(config, { TON_AUTO_APPROVE: true });
     config.paymentMethods.splice(0, config.paymentMethods.length, ...methods);
     await app?.close(); await indexer?.close();
-    await sql`DELETE FROM audit_logs WHERE actor_user_id = ${adminId}`;
-    await sql`DELETE FROM ton_payments WHERE receiver = ${receiver}`;
-    await sql`DELETE FROM ton_payment_scans WHERE address = ${receiver}`;
-    await sql`DELETE FROM orders WHERE user_id = ${userId} AND top_up_key_id IS NOT NULL`;
-    await sql`DELETE FROM api_keys WHERE user_id = ${userId}`;
-    await sql`DELETE FROM orders WHERE user_id = ${userId}`;
+    await clearInvoices();
     await sql`DELETE FROM users WHERE id IN (${userId}, ${adminId})`;
     await sql`DELETE FROM products WHERE id = ${productId}`;
     await sql`DELETE FROM upstream_credentials WHERE pool_id = ${poolId}`;
@@ -116,7 +122,7 @@ integration('direct USDT payments with real HTTP indexer and PostgreSQL', () => 
     const [order, other] = await Promise.all([buy(), buy()]);
     expect(order.metadata.verification).toBe('txid');
     expect(order.metadata.payinExtraId).toBeUndefined();
-    expect(order.metadata.payAmount).toMatch(/^20\.00\d{4}$/);
+    expect(order.metadata.payAmount).toMatch(/^20\.00[12]$/);
     expect(other.metadata.payAmount).not.toBe(order.metadata.payAmount);
     const action = transfer(order);
     actions = [action];
@@ -124,7 +130,7 @@ integration('direct USDT payments with real HTTP indexer and PostgreSQL', () => 
       method: 'POST', url: `/api/orders/${id}/payment-claim`, headers: userHeaders, payload: { transactionHash },
     });
     expect((await submit(order.id)).statusCode).toBe(409);
-    action.details.amount = String(order.metadata.payAmount).replace('.', '');
+    action.details.amount = new Decimal(String(order.metadata.payAmount)).mul(1_000_000).toFixed(0);
     await scanTonPayments();
     expect((await state(order.id)).status).toBe('PENDING');
     expect((await submit(other.id)).statusCode).toBe(409);
@@ -136,6 +142,63 @@ integration('direct USDT payments with real HTTP indexer and PostgreSQL', () => 
     const keys = await sql`SELECT credits_total::text AS total FROM api_keys WHERE order_id = ${order.id}`;
     expect(keys).toHaveLength(1);
     expect(Number(keys[0]!.total)).toBe(20);
+  });
+
+  it.each(['20.000123', '20.009'])('still verifies a previously issued invoice for %s without rounding it', async amount => {
+    const order = await buy();
+    await sql`UPDATE orders SET metadata = metadata || ${sql.json({ payAmount: amount })} WHERE id = ${order.id}`;
+    const action = transfer(order);
+    action.details.amount = new Decimal(amount).mul(1_000_000).toFixed(0);
+    actions = [action];
+    const response = await app.inject({ method: 'POST', url: `/api/orders/${order.id}/payment-claim`, headers: userHeaders,
+      payload: { transactionHash: action.transactions[0] } });
+    expect(response.statusCode).toBe(200);
+    expect(await state(order.id)).toMatchObject({ status: 'FULFILLED', metadata: { payAmount: amount } });
+    const [key] = await sql<{ total: string }[]>`SELECT credits_total::text AS total FROM api_keys WHERE order_id = ${order.id}`;
+    expect(Number(key!.total)).toBe(20);
+  });
+
+  it('allocates only two distinct amounts under concurrency and reuses an amount after its reservation expires', async () => {
+    const results = await Promise.allSettled([buy(), buy(), buy()]);
+    const allocated = results.flatMap(result => result.status === 'fulfilled' ? [result.value] : []);
+    const rejected = results.filter(result => result.status === 'rejected');
+    expect(allocated).toHaveLength(2);
+    expect(allocated.map(order => order.metadata.payAmount).sort()).toEqual(['20.001', '20.002']);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]).toMatchObject({ reason: { code: 'TON_INVOICES_BUSY', statusCode: 503 } });
+    const failed = await sql`SELECT metadata FROM orders WHERE user_id = ${userId} AND status = 'FAILED'`;
+    expect(failed).toHaveLength(1);
+    expect(failed[0]!.metadata.payAmount).toBeUndefined();
+
+    const expired = allocated[0]!;
+    await sql`UPDATE orders SET reserved_until = now() - interval '5 minutes' WHERE id = ${expired.id}`;
+    expect((await buy()).metadata.payAmount).toBe(expired.metadata.payAmount);
+  });
+
+  it.each([
+    ['1.00', ['1.001', '1.002']],
+    ['2.00', ['2.001', '2.002']],
+    ['5.00', ['5.001', '5.002']],
+    ['20.99', ['20.991', '20.992']],
+    ['19.9999', ['20.000', '20.001']],
+  ] as const)('keeps three decimal places and the surcharge cap for a base amount of %s', async (baseAmount, expected) => {
+    const orders = await Promise.all([buy(), buy()]);
+    // Exercise the checkout boundary directly, including a higher-precision historical price.
+    await sql`UPDATE orders SET amount = ${baseAmount}, credit_amount = ${baseAmount},
+      wholesale_credits = ${new Decimal(baseAmount).div(config.PRICE_MARKUP).toFixed(8)}, metadata = '{}'::jsonb
+      WHERE id IN (${orders[0]!.id}, ${orders[1]!.id})`;
+    const checkouts = await Promise.all(orders.map(order => createCheckout('ton', {
+      id: order.id, amount: baseAmount, currency: 'USDT', productName: 'TON key',
+      userEmail: 'ton-customer@example.test', reservedUntil: new Date(Date.now() + 60_000),
+    })));
+    expect(checkouts.map(checkout => checkout.metadata!.payAmount).sort()).toEqual(expected);
+    for (const [index, checkout] of checkouts.entries()) {
+      const amount = String(checkout.metadata!.payAmount);
+      const surcharge = new Decimal(amount).sub(baseAmount);
+      expect(amount).toMatch(/^\d+\.\d{3}$/);
+      expect(surcharge.gt(0) && surcharge.lte('0.002')).toBe(true);
+      expect((await state(orders[index]!.id)).metadata.payAmount).toBe(amount);
+    }
   });
   it('honors a slot override and uses the configured lifetime for new invoices', async () => {
     const order = await createOrder({ userId, userEmail: 'ton-customer@example.test', productId, paymentProvider: 'ton' });
@@ -155,8 +218,13 @@ integration('direct USDT payments with real HTTP indexer and PostgreSQL', () => 
 
     if (config.UPSTREAM_KEY_SLOT_LIMIT === 0) {
       await sql`UPDATE upstream_pools SET credential_capacity = 2 WHERE id = ${poolId}`;
+      // Use another price: both unique amounts for the original price are already reserved.
+      await sql`UPDATE products SET wholesale_credits = 11 WHERE id = ${productId}`;
       try { expect((await buy()).metadata.verification).toBe('txid'); }
-      finally { await sql`UPDATE upstream_pools SET credential_capacity = 100 WHERE id = ${poolId}`; }
+      finally {
+        await sql`UPDATE upstream_pools SET credential_capacity = 100 WHERE id = ${poolId}`;
+        await sql`UPDATE products SET wholesale_credits = 10 WHERE id = ${productId}`;
+      }
     }
   });
   it('reports a missing scanner as stale so a stopped worker cannot look healthy', async () => {
@@ -251,6 +319,8 @@ integration('direct USDT payments with real HTTP indexer and PostgreSQL', () => 
     expect((await state(first.id)).status).toBe('FULFILLED'); expect((await state(second.id)).status).toBe('FULFILLED');
   });
   it('counts only real payments in the admin financial totals', async () => {
+    const order = await legacyInvoice(); actions = [transfer(order)]; await scanTonPayments();
+    expect((await state(order.id)).status).toBe('FULFILLED');
     const real = await sql<{ revenue: string }[]>`SELECT COALESCE(sum(COALESCE(credit_amount, amount)), 0)::text AS revenue
       FROM orders WHERE status IN ('PAID', 'FULFILLED') AND payment_provider <> 'mock' AND COALESCE(metadata->>'testPayment', 'false') <> 'true'`;
     const response = await app.inject({ url: '/api/admin/stats', headers: adminHeaders });

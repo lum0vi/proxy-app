@@ -28,7 +28,7 @@ export interface CheckoutResult {
 
 const stripe = config.STRIPE_SECRET_KEY ? new Stripe(config.STRIPE_SECRET_KEY, { timeout: 20_000 }) : null;
 const tonInvoiceAmountStep = '0.001';
-const tonInvoiceAmountVariants = 9;
+const tonInvoiceAmountVariants = 2;
 
 export async function createCheckout(
   provider: PaymentProviderName,
@@ -42,18 +42,20 @@ export async function createCheckout(
     const payAmount = await sql.begin(async tx => {
       await tx`SELECT pg_advisory_xact_lock(hashtext('ton-invoice-amount'), hashtext(${receiver}))`;
       const start = randomInt(1, tonInvoiceAmountVariants + 1);
+      // Truncate before adding the suffix so rounding cannot exceed the 0.002 USDT cap.
       const [slot] = await tx<{ amount: string }[]>`SELECT candidate.amount::text FROM (
-        SELECT round(${order.amount}::numeric, 3) + n * ${tonInvoiceAmountStep}::numeric AS amount
+        SELECT trunc(${order.amount}::numeric, 3) + n * ${tonInvoiceAmountStep}::numeric AS amount
         FROM generate_series(1, ${tonInvoiceAmountVariants}::int) n
       ) candidate WHERE candidate.amount NOT IN (
         SELECT (metadata->>'payAmount')::numeric FROM orders WHERE payment_provider = 'ton'
           AND metadata->>'receiverRaw' = ${receiver} AND metadata->>'payAmount' IS NOT NULL
           AND reserved_until >= (SELECT created_at - interval '2 seconds' FROM orders WHERE id = ${order.id})
-      ) ORDER BY candidate.amount < round(${order.amount}::numeric, 3) + ${start}::int * ${tonInvoiceAmountStep}::numeric,
+      ) ORDER BY candidate.amount < trunc(${order.amount}::numeric, 3) + ${start}::int * ${tonInvoiceAmountStep}::numeric,
         candidate.amount LIMIT 1`;
       if (!slot) throw new AppError(503, 'TON_INVOICES_BUSY', 'Please try creating an invoice later');
-      await tx`UPDATE orders SET metadata = metadata || ${tx.json({ receiverRaw: receiver, payAmount: slot.amount })} WHERE id = ${order.id}`;
-      return slot.amount;
+      const amount = new Decimal(slot.amount).toFixed(3);
+      await tx`UPDATE orders SET metadata = metadata || ${tx.json({ receiverRaw: receiver, payAmount: amount })} WHERE id = ${order.id}`;
+      return amount;
     });
     return {
       externalId: `ton_${order.id}`,
