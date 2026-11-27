@@ -647,6 +647,8 @@ function BuyPage() {
         setError(ru ? 'Свежий курс USDT / ₽ недоступен. Повторите позже или выберите оплату USDT.' : 'A fresh USDT / RUB rate is unavailable. Try later or pay in USDT.');
       } else if (cause instanceof ApiError && cause.code === 'PAYMENT_PROVIDER_ERROR') {
         setError(ru ? 'Платёжная система не смогла выставить счёт. Проверьте способ оплаты или выберите другой пакет.' : 'The payment processor could not create an invoice. Check the payment method or choose another package.');
+      } else if (cause instanceof ApiError && cause.code === 'TON_INVOICES_BUSY') {
+        setError(ru ? 'Все уникальные суммы для этого пакета сейчас заняты. Попробуйте позже или выберите другой пакет.' : 'All unique payment amounts for this package are in use. Try later or choose another package.');
       } else if (cause instanceof ApiError && cause.code === 'PAYMENT_PROVIDER_UNAVAILABLE') {
         setError(ru ? 'Платёжная система временно недоступна. Счёт не получен — попробуйте позже.' : 'The payment processor is temporarily unavailable. No invoice was received — please try again later.');
       } else setError(cause instanceof Error ? cause.message : String(cause));
