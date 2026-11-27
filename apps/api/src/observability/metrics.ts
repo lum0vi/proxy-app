@@ -142,12 +142,13 @@ async function refreshBusinessMetrics(): Promise<void> {
     providerBalanceChecked.set(labels, balance.checkedAt ? balance.checkedAt.getTime() / 1000 : 0);
     providerBalanceHealthy.set(labels, Number(!balance.stale && !balance.lastError));
   }
-  const pools = await sql<{ provider: string; total: number; assigned: number; reserved: number; sellable: number }[]>`
+  const pools = await sql<{ provider: string; total: number; assigned: number; reserved: number; sellable: number; unlimited: number }[]>`
     SELECT up.slug AS provider,
       COALESCE(sum(slots.credential_capacity), 0)::int AS total,
       COALESCE(sum(slots.assigned), 0)::int AS assigned,
       COALESCE(sum(slots.reserved), 0)::int AS reserved,
-      COALESCE(sum(GREATEST(0, slots.credential_capacity - slots.assigned - slots.reserved)), 0)::int AS sellable
+      COALESCE(sum(COALESCE(slots.free_slots, 1)) FILTER (WHERE slots.id IS NOT NULL), 0)::int AS sellable,
+      count(*) FILTER (WHERE slots.id IS NOT NULL AND slots.free_slots IS NULL)::int AS unlimited
     FROM upstream_pools up LEFT JOIN sellable_upstream_slots slots ON slots.pool_id = up.id GROUP BY up.id
   `;
   poolCapacity.reset();
@@ -156,6 +157,7 @@ async function refreshBusinessMetrics(): Promise<void> {
     poolCapacity.set({ provider: pool.provider, kind: 'assigned' }, pool.assigned);
     poolCapacity.set({ provider: pool.provider, kind: 'reserved' }, pool.reserved);
     poolCapacity.set({ provider: pool.provider, kind: 'sellable' }, pool.sellable);
+    poolCapacity.set({ provider: pool.provider, kind: 'unlimited' }, pool.unlimited);
   }
 
   const credentials = await sql<{ provider: string; status: string; count: number }[]>`

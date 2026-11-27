@@ -1,3 +1,4 @@
+import { inspectTonTransaction } from '../services/ton-payments.js';
 import type { FastifyInstance } from 'fastify';
 import { Decimal } from 'decimal.js';
 import { z } from 'zod';
@@ -77,7 +78,7 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
         ), '[]'::jsonb) AS models,
         COALESCE((SELECT jsonb_agg(jsonb_build_object('model', r.model, 'protocol', r.protocol) ORDER BY r.model)
           FROM unpriced_pool_models r WHERE r.root_pool_id = p.pool_id), '[]'::jsonb) AS unpriced_models,
-        COALESCE((SELECT sum(GREATEST(0, s.credential_capacity - s.assigned - s.reserved))::int
+        COALESCE((SELECT sum(COALESCE(s.free_slots, 1))::int
           FROM sellable_upstream_slots s JOIN pool_channels c USING (pool_id) WHERE c.root_pool_id = up.id), 0) AS inventory
       FROM products p JOIN upstream_pools up ON up.id = p.pool_id
       WHERE p.active AND up.active
@@ -190,6 +191,11 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
     let hash: string;
     try { hash = tonHash(transactionHash); } catch { throw new AppError(400, 'INVALID_TRANSACTION_HASH', 'Enter a TON transaction hash'); }
     const userId = (request as AuthenticatedRequest).authUser.id;
+    const [invoice] = await sql`SELECT metadata FROM orders WHERE id = ${id} AND user_id = ${userId} AND payment_provider = 'ton'`;
+    if (assertFound(invoice, 'ORDER_NOT_FOUND', 'TON invoice not found').metadata.verification === 'txid') {
+      await inspectTonTransaction(id, hash, true);
+      return { verified: true };
+    }
     // A public hash is not proof that the submitter owns a payment. This only opens a review request.
     const [order] = await sql`UPDATE orders SET metadata = metadata || ${sql.json({
       paymentClaim: { transactionHash: hash, submittedAt: new Date().toISOString() },

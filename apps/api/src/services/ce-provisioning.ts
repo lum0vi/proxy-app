@@ -112,10 +112,10 @@ async function accessToken(db: Connection, ce: CeManagement, login: CeLogin, ren
   return session.access_token;
 }
 
-async function eligiblePools(db: Connection, slugs: string[]) {
+async function eligiblePools(db: Connection, slugs: string[], freeSlotsTarget: number) {
   return db<Pool[]>`
     SELECT pool.id, pool.slug, pool.base_url,
-      COALESCE((SELECT sum(GREATEST(0, slot.credential_capacity - slot.assigned - slot.reserved))
+      COALESCE((SELECT sum(COALESCE(slot.free_slots, ${freeSlotsTarget}::int))
         FROM sellable_upstream_slots slot JOIN upstream_credentials uc ON uc.id = slot.id
         WHERE slot.pool_id = pool.id AND NOT slot.test_only
           AND (uc.spend_limit IS NULL OR uc.spend_limit - uc.spend_used - COALESCE((
@@ -259,7 +259,7 @@ export async function provisionCeKeys(settings: CeProvisioningSettings, request:
   if (!settings.targets.length) return;
   const ce = new CeManagement(request);
   await withCeLock(async (db) => {
-    const poolRows = await eligiblePools(db, settings.targets.map(target => target.slug));
+    const poolRows = await eligiblePools(db, settings.targets.map(target => target.slug), settings.freeSlots);
     const jobs = await db<(Job & { poolId: string })[]>`
       SELECT pool_id, id, name, account_id, group_id, quota::text, encrypted_key, credential_id, attempts, retry_at
       FROM ce_key_provisioning_jobs

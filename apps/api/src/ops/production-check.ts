@@ -39,7 +39,7 @@ async function main() {
   for (const admin of admins) defaultAdmin ||= await verifyPassword('ChangeThisAdminPassword123!', admin.passwordHash);
   check(!defaultAdmin, 'Existing active administrators do not use the development bootstrap password');
   const [capacity] = await sql<{ count: number }[]>`SELECT count(*)::int AS count FROM sellable_upstream_slots
-    WHERE NOT test_only AND assigned + reserved < credential_capacity`;
+    WHERE NOT test_only AND (free_slots IS NULL OR free_slots > 0)`;
   check((capacity?.count ?? 0) > 0, 'Verified paid provider capacity available for sale');
   const [products] = await sql<{ count: number }[]>`SELECT count(*)::int AS count FROM products WHERE active AND wholesale_credits > 0 AND currency = 'USDT'`;
   check((products?.count ?? 0) > 0, 'Active USDT packages configured');

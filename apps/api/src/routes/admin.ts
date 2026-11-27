@@ -1,4 +1,5 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
+import type { TransactionSql } from 'postgres';
 import { z } from 'zod';
 import { Decimal } from 'decimal.js';
 import { requireAdmin } from '../auth/session.js';
@@ -75,12 +76,12 @@ const rateSchema = z.object({
   active: z.boolean().default(true),
 });
 
-async function audit(request: FastifyRequest, action: string, entityType: string, entityId?: string, metadata = {}) {
+async function audit(request: FastifyRequest, action: string, entityType: string, entityId?: string, metadata = {}, db: typeof sql | TransactionSql = sql) {
   const user = (request as AuthenticatedRequest).authUser;
   const rawIp = request.ip;
-  await sql`
+  await db`
     INSERT INTO audit_logs (actor_user_id, action, entity_type, entity_id, metadata, ip_address)
-    VALUES (${user.id}, ${action}, ${entityType}, ${entityId ?? null}, ${sql.json(metadata)}, ${rawIp})
+    VALUES (${user.id}, ${action}, ${entityType}, ${entityId ?? null}, ${db.json(metadata)}, ${rawIp})
   `;
 }
 
@@ -151,7 +152,8 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
   app.get('/api/admin/pools', async () => {
     const pools = await sql<Record<string, unknown>[]>`
       SELECT up.id, up.name, up.slug, up.base_url, up.protocol, up.parent_pool_id, up.routing_priority, up.credential_capacity, up.active,
-        (SELECT count(*)::int FROM upstream_credentials uc WHERE uc.pool_id = up.id) AS credential_count,
+        upstream_key_slot_limit(up.credential_capacity) AS slot_limit,
+        (SELECT count(*)::int FROM upstream_credentials uc WHERE uc.pool_id = up.id AND uc.deleted_at IS NULL) AS credential_count,
         COALESCE((SELECT sum(s.assigned)::int FROM sellable_upstream_slots s WHERE s.pool_id = up.id), 0) AS assigned_keys,
         up.created_at
       FROM upstream_pools up
@@ -183,7 +185,7 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       const [current] = await transaction<{ baseUrl: string }[]>`SELECT base_url FROM upstream_pools WHERE id = ${params.id} FOR UPDATE`;
       const pool = assertFound(current, 'POOL_NOT_FOUND', 'Provider pool not found');
       if (body.baseUrl && body.baseUrl !== pool.baseUrl) {
-        const [credential] = await transaction`SELECT id FROM upstream_credentials WHERE pool_id = ${params.id} LIMIT 1`;
+        const [credential] = await transaction`SELECT id FROM upstream_credentials WHERE pool_id = ${params.id} AND deleted_at IS NULL LIMIT 1`;
         if (credential) throw new AppError(409, 'POOL_HAS_CREDENTIALS', 'Create a separate pool for a different API base URL');
       }
       await transaction`
@@ -210,6 +212,7 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       FROM upstream_credentials uc
       JOIN upstream_pools up ON up.id = uc.pool_id
       LEFT JOIN sellable_upstream_slots s ON s.id = uc.id
+      WHERE uc.deleted_at IS NULL
       ORDER BY up.name, uc.priority DESC, uc.created_at
     `;
     return { credentials };
@@ -240,6 +243,7 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
   app.patch('/api/admin/credentials/:id', async (request) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const body = z.object({
+      label: credentialSchema.shape.label.optional(),
       status: z.enum(['ACTIVE', 'DEGRADED', 'DISABLED', 'EXHAUSTED']).optional(),
       priority: z.number().int().min(0).max(10_000).optional(),
       maxConcurrency: z.number().int().min(1).max(1000).optional(),
@@ -250,6 +254,7 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     const recheck = Boolean(body.apiKey) || body.status === 'ACTIVE' || body.testOnly !== undefined;
     const rows = await sql<{ id: string }[]>`
       UPDATE upstream_credentials SET
+        label = COALESCE(${body.label ?? null}, label),
         status = CASE WHEN ${body.status === 'DISABLED' || body.status === 'EXHAUSTED'} THEN ${body.status ?? null}::text
                       WHEN ${recheck} AND (status <> 'DISABLED' OR ${body.status === 'ACTIVE'}) THEN 'DEGRADED'
                       ELSE COALESCE(${body.status ?? null}, status) END,
@@ -263,7 +268,7 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
         available_models = CASE WHEN ${recheck} THEN ARRAY[]::text[] ELSE available_models END,
         catalog_valid_until = CASE WHEN ${recheck} THEN NULL ELSE catalog_valid_until END,
         updated_at = now()
-      WHERE id = ${params.id} RETURNING id
+      WHERE id = ${params.id} AND deleted_at IS NULL RETURNING id
     `.catch((error: unknown) => {
       if (isDuplicateUpstreamKey(error)) throw new AppError(409, 'UPSTREAM_KEY_DUPLICATE', 'This provider key is already registered');
       throw error;
@@ -272,6 +277,36 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     await audit(request, 'UPDATE', 'UPSTREAM_CREDENTIAL', params.id, { ...body, apiKey: body.apiKey ? '[REDACTED]' : undefined });
     if (recheck) await checkCatalogForAdmin(request, params.id);
     return { ok: true };
+  });
+
+  app.delete('/api/admin/credentials/:id', async (request, reply) => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    await sql.begin(async tx => {
+      const [credential] = await tx<{ label: string; deletedAt: Date | null }[]>`
+        SELECT label, deleted_at FROM upstream_credentials WHERE id = ${id} FOR UPDATE
+      `;
+      const current = assertFound(credential, 'CREDENTIAL_NOT_FOUND', 'Upstream key not found');
+      if (current.deletedAt) return;
+
+      const [blocked] = await tx`
+        SELECT 1 WHERE EXISTS (
+          SELECT 1 FROM request_leases WHERE upstream_credential_id = ${id} AND expires_at > now()
+        ) OR EXISTS (
+          SELECT 1 FROM video_jobs WHERE upstream_credential_id = ${id} AND (
+            state NOT IN ('COMPLETED', 'FAILED') OR (state = 'COMPLETED' AND (expires_at IS NULL OR expires_at > now()))
+          )
+        ) OR EXISTS (
+          SELECT 1 FROM ce_key_provisioning_jobs WHERE credential_id = ${id}
+        )
+      `;
+      if (blocked) throw new AppError(409, 'CREDENTIAL_IN_USE', 'The key is still needed for active requests, accessible videos, or CE provisioning.');
+
+      // Retain the row for orders, usage history, and automatic reassignment of client keys.
+      await tx`UPDATE upstream_credentials SET status = 'DISABLED', encrypted_key = '', key_fingerprint = NULL,
+        catalog_valid_until = NULL, deleted_at = now(), updated_at = now() WHERE id = ${id}`;
+      await audit(request, 'DELETE', 'UPSTREAM_CREDENTIAL', id, { label: current.label }, tx);
+    });
+    return reply.code(204).send();
   });
 
   app.get('/api/admin/products', async () => {

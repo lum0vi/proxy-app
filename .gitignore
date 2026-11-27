@@ -1,12 +1,10 @@
 node_modules/
 dist/
 coverage/
-!.env.example
+.idea/
 *.log
 .DS_Store
 .vite/
 playwright-report/
 test-results/
 *.tsbuildinfo
-
-/.env

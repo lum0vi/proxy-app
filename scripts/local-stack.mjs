@@ -30,7 +30,7 @@ const commands = {
   stop: ['stop', '--timeout', '30'],
   logs: ['logs', '--tail', '100', 'migrate', 'api', 'worker', 'nginx'],
 };
-if (action === 'up') console.info('Starting Ksapi locally on loopback. Sales and mock payments are disabled. Production .env is preserved.');
+if (action === 'up') console.info('Starting Ksapi locally on loopback with docker-compose.local.yml.');
 const child = spawn(compose.command, [...base, ...commands[action]], { cwd: root, stdio: 'inherit' });
 child.on('error', () => { console.error('Could not start Docker Compose.'); process.exitCode = 1; });
 child.on('exit', (code, signal) => {

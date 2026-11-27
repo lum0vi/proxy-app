@@ -58,7 +58,7 @@ async function approve(tx: postgres.TransactionSql, receipt: Receipt, order: Ton
 }
 
 /** Accepts only the indexer's finalized successful USDT actions, never a browser's transaction data. */
-async function recordAction(input: unknown, expectedReceiver: string): Promise<string | null> {
+async function recordAction(input: unknown, expectedReceiver: string, claim?: { orderId: string; hash: string }): Promise<string | null> {
   const parsed = actionSchema.safeParse(input);
   if (!parsed.success) return null;
   const action = parsed.data;
@@ -77,6 +77,23 @@ async function recordAction(input: unknown, expectedReceiver: string): Promise<s
         ${comment}, ${new Date(action.end_utime * 1000)}, 'UNMATCHED')
       ON CONFLICT (trace_id, action_id) DO NOTHING
       RETURNING id, order_id, receiver, master, amount_units::text, status, comment, transferred_at`;
+    if (claim) {
+      const receipt = inserted ?? (await tx<Receipt[]>`SELECT id, order_id, receiver, master, amount_units::text, status, comment, transferred_at
+        FROM ton_payments WHERE trace_id = ${traceId} AND action_id = ${actionId} FOR UPDATE`)[0]!;
+      const order = await lockedOrder(tx, claim.orderId);
+      if (receipt.orderId === order.id && receipt.status === 'APPROVED') return { id: receipt.id, paid: null };
+      if (receipt.status !== 'REVIEW' || order.metadata.verification !== 'txid' || !['PENDING', 'EXPIRED'].includes(order.status)
+        || receipt.transferredAt > order.reservedUntil
+        || !new Decimal(String(order.metadata.payAmount)).mul(1_000_000).eq(receipt.amountUnits)) {
+        throw new AppError(409, 'PAYMENT_MISMATCH', 'Transfer does not match this invoice');
+      }
+      await tx`SELECT pg_advisory_xact_lock(hashtext('ton-claimed-txid'), hashtext(${claim.hash}))`;
+      const [used] = await tx`SELECT id FROM orders WHERE payment_provider = 'ton' AND metadata->>'verifiedTxid' = ${claim.hash}`;
+      if (used) throw new AppError(409, 'PAYMENT_ALREADY_USED', 'This transaction has already been credited');
+      await tx`UPDATE orders SET metadata = metadata || ${tx.json({ verifiedTxid: claim.hash })} WHERE id = ${order.id}`;
+      await approve(tx, receipt, order, null, 'Verified customer TXID ' + claim.hash);
+      return { id: receipt.id, paid: order.id };
+    }
     if (!inserted) return { id: null, paid: null };
     const [match] = comment ? await tx<{ id: string }[]>`SELECT id FROM orders
       WHERE payment_provider = 'ton' AND metadata->>'payinExtraId' = ${comment}` : [];
@@ -160,7 +177,7 @@ export async function scanTonPayments(): Promise<void> {
   }
 }
 
-export async function inspectTonTransaction(orderId: string, transactionHash: string): Promise<void> {
+export async function inspectTonTransaction(orderId: string, transactionHash: string, customerClaim = false): Promise<void> {
   const [order] = await sql<{ metadata: Record<string, unknown> }[]>`SELECT metadata FROM orders WHERE id = ${orderId} AND payment_provider = 'ton'`;
   const receiver = assertFound(order, 'ORDER_NOT_FOUND', 'TON invoice not found').metadata.receiverRaw;
   if (typeof receiver !== 'string') throw new AppError(409, 'INVOICE_NOT_READY', 'Invoice is not ready');
@@ -175,7 +192,10 @@ export async function inspectTonTransaction(orderId: string, transactionHash: st
     try {
       if (tonAddress(parsed.data.details.receiver) !== receiver || tonAddress(parsed.data.details.asset) !== master) continue;
     } catch { continue; }
-    await recordAction(action, receiver); found = true;
+    if (customerClaim && !new Decimal(parsed.data.details.amount).eq(new Decimal(String(order!.metadata.payAmount)).mul(1_000_000))) continue;
+    const receipt = await recordAction(action, receiver, customerClaim ? { orderId, hash } : undefined);
+    if (customerClaim && receipt) return;
+    if (receipt || !customerClaim) found = true;
   }
   if (!found) throw new AppError(409, 'TRANSFER_NOT_CONFIRMED', 'No finalized USDT transfer to this invoice wallet was found');
 }
@@ -189,7 +209,9 @@ export async function reviewTonPayment(input: { id: string; decision: 'approve' 
     const orderId = input.orderId ?? row.orderId;
     if (input.decision === 'approve' && !orderId) throw new AppError(400, 'ORDER_REQUIRED', 'Choose the verified customer order');
     if (input.decision === 'approve') {
-      await approve(tx, row, await lockedOrder(tx, orderId!), input.actorId, input.note);
+      const order = await lockedOrder(tx, orderId!);
+      if (order.metadata.verification === 'txid') throw new AppError(409, 'TXID_REQUIRED', 'Customer TXID verification required');
+      await approve(tx, row, order, input.actorId, input.note);
     } else {
       await tx`UPDATE ton_payments SET status = 'REJECTED', reviewed_by = ${input.actorId}, review_note = ${input.note},
         reviewed_at = now() WHERE id = ${row.id}`;

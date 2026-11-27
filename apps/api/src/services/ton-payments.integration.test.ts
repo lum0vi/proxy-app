@@ -7,6 +7,7 @@ import { config } from '../config.js';
 import { sql } from '../db/index.js';
 import { encryptSecret, sha256, upstreamKeyFingerprint } from '../lib/crypto.js';
 import { tonAddress, USDT_TON_MASTER } from '../lib/ton.js';
+import { selectCredentialWithCapacity } from './capacity.js';
 import { createOrder } from './orders.js';
 import { scanTonPayments } from './ton-payments.js';
 
@@ -27,6 +28,13 @@ integration('direct USDT payments with real HTTP indexer and PostgreSQL', () => 
     // Chain time precedes polling by a minute, but follows invoice creation.
     await sql`UPDATE orders SET created_at = now() - interval '2 minutes' WHERE id = ${String(order.id)}`;
     return { id: String(order.id), metadata: order.metadata as Record<string, unknown> };
+  }
+  async function legacyInvoice(topUpKeyId?: string) {
+    const order = await buy(topUpKeyId);
+    const [legacy] = await sql`UPDATE orders SET metadata = (metadata - 'verification') || ${sql.json({
+      payinExtraId: 'ks_' + order.id.replaceAll('-', ''), payAmount: '20.00', autoApprove: config.TON_AUTO_APPROVE,
+    })} WHERE id = ${order.id} RETURNING metadata`;
+    return { ...order, metadata: legacy!.metadata as Record<string, unknown> };
   }
   function transfer(order: Awaited<ReturnType<typeof buy>>, changes: Record<string, any> = {}) {
     return { type: 'jetton_transfer', success: true, finality: 'finalized', trace_mc_seqno_end: 100,
@@ -104,12 +112,52 @@ integration('direct USDT payments with real HTTP indexer and PostgreSQL', () => 
     await sql`DELETE FROM upstream_pools WHERE id = ${poolId}`;
   });
 
-  it('creates an exact USDT invoice and unique comment without calling a payment processor', async () => {
-    const count = requestCount;
-    const order = await buy();
-    expect(order.metadata).toMatchObject({ receiverRaw: receiver, payAmount: '20.00', network: 'TON', asset: 'USDT', autoApprove: true });
-    expect(order.metadata.payinExtraId).toMatch(/^ks_[a-f\d]{32}$/);
-    expect(requestCount).toBe(count);
+  it('credits only an exact verified TXID for its invoice, once across concurrent submissions', async () => {
+    const [order, other] = await Promise.all([buy(), buy()]);
+    expect(order.metadata.verification).toBe('txid');
+    expect(order.metadata.payinExtraId).toBeUndefined();
+    expect(order.metadata.payAmount).toMatch(/^20\.00\d{4}$/);
+    expect(other.metadata.payAmount).not.toBe(order.metadata.payAmount);
+    const action = transfer(order);
+    actions = [action];
+    const submit = (id: string, transactionHash = action.transactions[0]) => app.inject({
+      method: 'POST', url: `/api/orders/${id}/payment-claim`, headers: userHeaders, payload: { transactionHash },
+    });
+    expect((await submit(order.id)).statusCode).toBe(409);
+    action.details.amount = String(order.metadata.payAmount).replace('.', '');
+    await scanTonPayments();
+    expect((await state(order.id)).status).toBe('PENDING');
+    expect((await submit(other.id)).statusCode).toBe(409);
+    expect((await submit(order.id, hash())).statusCode).toBe(409);
+    const replies = await Promise.all([submit(order.id), submit(order.id)]);
+    expect(replies.map(reply => reply.statusCode)).toEqual([200, 200]);
+    expect((await state(order.id)).status).toBe('FULFILLED');
+    expect((await state(other.id)).status).toBe('PENDING');
+    const keys = await sql`SELECT credits_total::text AS total FROM api_keys WHERE order_id = ${order.id}`;
+    expect(keys).toHaveLength(1);
+    expect(Number(keys[0]!.total)).toBe(20);
+  });
+  it('honors a slot override and uses the configured lifetime for new invoices', async () => {
+    const order = await createOrder({ userId, userEmail: 'ton-customer@example.test', productId, paymentProvider: 'ton' });
+    const [deadline] = await sql<{ seconds: number }[]>`SELECT ceil(extract(epoch FROM reserved_until - created_at))::int AS seconds
+      FROM orders WHERE id = ${String(order.id)}`;
+    expect(deadline?.seconds).toBe(config.TON_INVOICE_TTL_MINUTES * 60);
+    await buy();
+
+    await sql.begin(async tx => {
+      await tx`SELECT set_config('proxykey.upstream_key_slot_limit', '2', true)`;
+      await expect(selectCredentialWithCapacity(tx, poolId)).rejects.toMatchObject({ code: 'NO_UPSTREAM_CAPACITY' });
+      await tx`SELECT set_config('proxykey.upstream_key_slot_limit', '0', true)`;
+      const [slots] = await tx`SELECT credential_capacity, free_slots FROM sellable_upstream_slots WHERE pool_id = ${poolId}`;
+      expect(slots).toEqual({ credentialCapacity: null, freeSlots: null });
+      await expect(selectCredentialWithCapacity(tx, poolId)).resolves.toHaveProperty('poolId', poolId);
+    });
+
+    if (config.UPSTREAM_KEY_SLOT_LIMIT === 0) {
+      await sql`UPDATE upstream_pools SET credential_capacity = 2 WHERE id = ${poolId}`;
+      try { expect((await buy()).metadata.verification).toBe('txid'); }
+      finally { await sql`UPDATE upstream_pools SET credential_capacity = 100 WHERE id = ${poolId}`; }
+    }
   });
   it('reports a missing scanner as stale so a stopped worker cannot look healthy', async () => {
     const response = await app.inject({ url: '/metrics' });
@@ -118,19 +166,19 @@ integration('direct USDT payments with real HTTP indexer and PostgreSQL', () => 
     expect(response.body).toContain('proxiapp_ton_scan_lag_seconds 86400\n');
   });
   it('credits a finalized payment once even on concurrent and repeated scans, then tops up the same key', async () => {
-    const order = await buy(); actions = [transfer(order)];
+    const order = await legacyInvoice(); actions = [transfer(order)];
     await Promise.all([scanTonPayments(), scanTonPayments()]); await scanTonPayments();
     expect((await state(order.id)).status).toBe('FULFILLED');
     const keys = await sql<{ id: string; creditsTotal: string }[]>`SELECT id, credits_total::text FROM api_keys WHERE order_id = ${order.id}`;
     expect(keys).toHaveLength(1); expect(Number(keys[0]!.creditsTotal)).toBe(20);
-    const topup = await buy(keys[0]!.id); actions = [transfer(topup)];
+    const topup = await legacyInvoice(keys[0]!.id); actions = [transfer(topup)];
     await sql`DELETE FROM ton_payment_scans WHERE address = ${receiver}`;
     await scanTonPayments(); await scanTonPayments();
     const [key] = await sql<{ total: string }[]>`SELECT credits_total::text AS total FROM api_keys WHERE id = ${keys[0]!.id}`;
     expect(Number(key!.total)).toBe(40);
   });
   it.each(['fake-token', 'wrong-wallet', 'failed', 'not-final', 'encrypted', 'wrong-comment'])('does not credit %s', async scenario => {
-    const order = await buy(), action = transfer(order);
+    const order = await legacyInvoice(), action = transfer(order);
     if (scenario === 'fake-token') action.details.asset = `0:${'33'.repeat(32)}`;
     if (scenario === 'wrong-wallet') action.details.receiver = `0:${'44'.repeat(32)}`;
     if (scenario === 'failed') action.success = false;
@@ -141,7 +189,7 @@ integration('direct USDT payments with real HTTP indexer and PostgreSQL', () => 
     expect((await state(order.id)).status).toBe('PENDING');
   });
   it('holds underpayment for review and refuses to approve it or permit a user to review payments', async () => {
-    const order = await buy(), action = transfer(order); action.details.amount = '19999999'; actions = [action];
+    const order = await legacyInvoice(), action = transfer(order); action.details.amount = '19999999'; actions = [action];
     await scanTonPayments(); const row = await receipt(order.id);
     expect(row.reason).toBe('PAYMENT_UNDERPAID');
     expect((await review(row.id, 'approve', undefined, userHeaders)).statusCode).toBe(403);
@@ -149,7 +197,7 @@ integration('direct USDT payments with real HTTP indexer and PostgreSQL', () => 
     expect((await state(order.id)).status).toBe('PENDING');
   });
   it('holds overpayment, records an administrator decision and prevents reuse', async () => {
-    const order = await buy(), action = transfer(order); action.details.amount = '21000000'; actions = [action];
+    const order = await legacyInvoice(), action = transfer(order); action.details.amount = '21000000'; actions = [action];
     await scanTonPayments(); const row = await receipt(order.id);
     expect(row.reason).toBe('OVERPAID');
     expect((await review(row.id, 'approve')).statusCode).toBe(200);
@@ -161,8 +209,8 @@ integration('direct USDT payments with real HTTP indexer and PostgreSQL', () => 
     expect(audit).toHaveLength(1);
   });
   it('accepts an on-time transfer discovered after expiry but reviews a transfer sent late', async () => {
-    const onTime = await buy(); await sql`UPDATE orders SET status = 'EXPIRED' WHERE id = ${onTime.id}`;
-    const late = await buy(); await sql`UPDATE orders SET status = 'EXPIRED', reserved_until = now() - interval '90 seconds' WHERE id = ${late.id}`;
+    const onTime = await legacyInvoice(); await sql`UPDATE orders SET status = 'EXPIRED' WHERE id = ${onTime.id}`;
+    const late = await legacyInvoice(); await sql`UPDATE orders SET status = 'EXPIRED', reserved_until = now() - interval '90 seconds' WHERE id = ${late.id}`;
     actions = [transfer(onTime), transfer(late)]; await scanTonPayments();
     expect((await state(onTime.id)).status).toBe('FULFILLED');
     expect((await state(late.id)).status).toBe('EXPIRED'); expect((await receipt(late.id)).reason).toBe('LATE_PAYMENT');
@@ -170,7 +218,7 @@ integration('direct USDT payments with real HTTP indexer and PostgreSQL', () => 
   });
   it('supports manual mode, rejection and a later audited correction', async () => {
     Object.assign(config, { TON_AUTO_APPROVE: false });
-    const order = await buy(); actions = [transfer(order)]; await scanTonPayments();
+    const order = await legacyInvoice(); actions = [transfer(order)]; await scanTonPayments();
     const row = await receipt(order.id); expect(row.reason).toBe('MANUAL_MODE');
     expect((await review(row.id, 'reject')).statusCode).toBe(200);
     expect((await state(order.id)).status).toBe('PENDING');
@@ -178,7 +226,7 @@ integration('direct USDT payments with real HTTP indexer and PostgreSQL', () => 
     expect((await state(order.id)).status).toBe('FULFILLED');
   });
   it('does not treat a customer hash as payment; inspects and links a missing-comment transfer only through admin review', async () => {
-    const order = await buy(), action = transfer(order); action.details.comment = null; actions = [action];
+    const order = await legacyInvoice(), action = transfer(order); action.details.comment = null; actions = [action];
     const transactionHash = Buffer.from(action.transactions[0]!, 'base64').toString('hex');
     expect((await app.inject({ method: 'POST', url: `/api/orders/${order.id}/payment-claim`, headers: userHeaders, payload: { transactionHash } })).statusCode).toBe(200);
     expect((await state(order.id)).status).toBe('PENDING');
@@ -190,7 +238,7 @@ integration('direct USDT payments with real HTTP indexer and PostgreSQL', () => 
     expect((await state(order.id)).status).toBe('FULFILLED');
   });
   it('does not advance the scan watermark or credit on outage, and recovers with persistent pagination', async () => {
-    const first = await buy(), second = await buy(); actions = [transfer(first), transfer(second)];
+    const first = await legacyInvoice(), second = await legacyInvoice(); actions = [transfer(first), transfer(second)];
     available = false; await scanTonPayments();
     const [failed] = await sql<{ errorCode: string; scannedThrough: Date }[]>`SELECT error_code, scanned_through FROM ton_payment_scans WHERE address = ${receiver}`;
     expect(failed!.errorCode).toBe('TON_SCAN_FAILED'); expect((await state(first.id)).status).toBe('PENDING');
