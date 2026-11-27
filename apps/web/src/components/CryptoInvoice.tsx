@@ -17,6 +17,7 @@ export function CryptoInvoice({ order, deadline, reload }: {
   useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 1000); return () => window.clearInterval(timer); }, []);
   const meta = order.metadata;
   const direct = order.paymentProvider === 'ton';
+  const txid = direct && meta.verification === 'txid';
   const seconds = Math.max(0, Math.ceil((deadline - now) / 1000));
   const review = ['REVIEW', 'REJECTED'].includes(String(meta.tonPaymentStatus));
   const canPay = order.status === 'PENDING' && seconds > 0 && !review && !meta.paymentClaim && !sent;
@@ -30,6 +31,8 @@ export function CryptoInvoice({ order, deadline, reload }: {
       setSent(true); await reload();
     } catch (cause) { setError(cause instanceof ApiError && cause.code === 'INVALID_TRANSACTION_HASH'
       ? (ru ? 'Введите хеш транзакции из кошелька, без ссылки.' : 'Enter the transaction hash from your wallet, without the URL.')
+      : txid && cause instanceof ApiError && cause.status === 409
+      ? (ru ? 'Перевод не подтверждён для этого счёта. Проверьте TXID и сумму. Если перевод ещё обрабатывается, повторите проверку позже.' : 'Transfer unconfirmed for this invoice. Check the TXID and amount. If pending, retry later.')
       : (ru ? 'Не удалось отправить заявку. Попробуйте ещё раз.' : 'Could not submit the request. Please try again.')); }
     finally { setBusy(false); }
   }
@@ -44,15 +47,15 @@ export function CryptoInvoice({ order, deadline, reload }: {
       <div className="payment-countdown"><Clock3 size={16}/><span>{ru ? 'Счёт действует ещё' : 'Invoice expires in'}</span><b>{countdown}</b></div>
       <ol className="payment-instructions">
         <li><span>1</span><div><h3>{ru ? 'Выберите USDT и сеть TON' : 'Choose USDT on TON'}</h3>
-          <p>{ru ? 'Отправьте точную сумму одним переводом. Для комиссии кошельку может понадобиться немного TON.' : 'Send the exact amount in one transfer. Your wallet may need a small TON balance for network fees.'}</p></div></li>
+          <p>{txid ? (ru ? 'Сумма должна полностью совпадать со счётом, включая все шесть знаков после запятой. В неё входит небольшая доплата для идентификации платежа. Скопируйте сумму и отправьте одним переводом без комментария.' : 'The amount must match exactly, including all six decimal places. It includes a small surcharge to identify your payment. Copy the amount and send one transfer without a comment.') : ru ? 'Отправьте точную сумму одним переводом. Для комиссии кошельку может понадобиться немного TON.' : 'Send the exact amount in one transfer. Your wallet may need a small TON balance for network fees.'}</p></div></li>
         <li><span>2</span><div><h3>{ru ? 'Скопируйте адрес получателя' : 'Copy the receiving address'}</h3>
           <div className="payment-copy-row"><code>{String(meta.payAddress)}</code><CopyButton value={String(meta.payAddress)}/></div>
           {!!meta.payinExtraId && <><h3>{ru ? 'Добавьте комментарий к переводу' : 'Include this transfer comment'}</h3>
             <div className="payment-copy-row memo"><code>{String(meta.payinExtraId)}</code><CopyButton value={String(meta.payinExtraId)}/></div>
             <p>{ru ? 'По нему мы найдём ваш заказ. Используйте кошелёк, который позволяет отправлять открытый комментарий.' : 'It identifies your order. Use a wallet that supports an unencrypted transfer comment.'}</p></>}
         </div></li>
-        <li><span>3</span><div><h3>{ru ? 'Дождитесь подтверждения' : 'Wait for confirmation'}</h3>
-          <p>{direct && meta.autoApprove === false
+        <li><span>3</span><div><h3>{txid ? (ru ? 'Отправьте TXID' : 'Submit your TXID') : ru ? 'Дождитесь подтверждения' : 'Wait for confirmation'}</h3>
+          <p>{txid ? (ru ? 'Введите TXID из кошелька ниже. Баланс зачислится только после проверки перевода.' : 'Enter your wallet transaction ID below. Your balance is credited after verification.') : direct && meta.autoApprove === false
             ? (ru ? 'Перевод проверит администратор. Статус обновится на этой странице.' : 'An administrator will review the transfer. The status updates on this page.')
             : (ru ? 'Проверяем поступление автоматически. После подтверждения баланс зачислится, а статус обновится здесь.' : 'We check incoming transfers automatically. Your balance and this page update after confirmation.')}</p></div></li>
       </ol>
@@ -62,9 +65,14 @@ export function CryptoInvoice({ order, deadline, reload }: {
       ? (ru ? 'Платёж требует проверки' : 'Payment needs review')
       : meta.paymentClaim || sent ? (ru ? 'Заявка на проверку отправлена' : 'Review request submitted')
       : (ru ? 'Срок счёта истёк' : 'Invoice expired')}</h3>
-      <p>{ru ? 'Если вы уже отправили перевод, не платите повторно. Мы проверим поступление. Поздние платежи и платежи без комментария рассматривает администратор.'
+      <p>{txid ? (ru ? 'Если перевод уже отправлен, не платите повторно.' : 'If you already paid, do not send another transfer.') : ru ? 'Если вы уже отправили перевод, не платите повторно. Мы проверим поступление. Поздние платежи и платежи без комментария рассматривает администратор.'
         : 'If you already sent a transfer, do not pay again. We will check it. Late transfers and transfers without a comment require administrator review.'}</p></div>}
-    {direct && <details className="payment-help"><summary><Copy size={15}/>{ru ? 'Уже оплатили, но статус не изменился?' : 'Paid but the status has not changed?'}</summary>
+    {txid && !sent && <form onSubmit={submitClaim}>
+      <label className="field"><span>TXID</span><input name="hash" required minLength={43} maxLength={64} autoComplete="off"/></label>
+      {error && <p role="alert">{error}</p>}
+      <button className="button" disabled={busy}>{ru ? 'Проверить TXID' : 'Verify TXID'}</button>
+    </form>}
+    {direct && !txid && <details className="payment-help"><summary><Copy size={15}/>{ru ? 'Уже оплатили, но статус не изменился?' : 'Paid but the status has not changed?'}</summary>
       <p>{ru ? 'Подтверждение может занять несколько минут. Если комментарий не был добавлен или платёж не найден, пришлите хеш транзакции. Администратор сверит перевод; заявка сама по себе не зачисляет деньги.'
         : 'Confirmation can take a few minutes. If the comment is missing or the payment was not found, submit the transaction hash for review. Submitting a hash does not credit the balance.'}</p>
       <form onSubmit={event => void submitClaim(event)}><label className="field"><span>{ru ? 'Хеш транзакции' : 'Transaction hash'}</span>

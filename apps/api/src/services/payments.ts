@@ -1,4 +1,5 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomInt, timingSafeEqual } from 'node:crypto';
+import { sql } from '../db/index.js';
 import Stripe from 'stripe';
 import { config } from '../config.js';
 import { AppError } from '../lib/errors.js';
@@ -35,14 +36,29 @@ export async function createCheckout(
   if (provider === 'ton') {
     if (!config.TON_RECEIVER_ADDRESS) throw new AppError(503, 'PAYMENT_PROVIDER_UNAVAILABLE', 'TON payments are not configured');
     if (order.currency !== 'USDT') throw new AppError(400, 'INVALID_CURRENCY', 'TON checkout requires USDT');
+    const receiver = tonAddress(config.TON_RECEIVER_ADDRESS);
+    const payAmount = await sql.begin(async tx => {
+      await tx`SELECT pg_advisory_xact_lock(hashtext('ton-invoice-amount'), hashtext(${receiver}))`;
+      const start = randomInt(1, 10000);
+      const [slot] = await tx<{ amount: string }[]>`SELECT candidate.amount::text FROM (
+        SELECT round(${order.amount}::numeric, 6) + n * 0.000001 AS amount FROM generate_series(1, 9999) n
+      ) candidate WHERE candidate.amount NOT IN (
+        SELECT (metadata->>'payAmount')::numeric FROM orders WHERE payment_provider = 'ton'
+          AND metadata->>'receiverRaw' = ${receiver} AND metadata->>'payAmount' IS NOT NULL
+          AND reserved_until >= (SELECT created_at - interval '2 seconds' FROM orders WHERE id = ${order.id})
+      ) ORDER BY candidate.amount < round(${order.amount}::numeric, 6) + ${start}::int * 0.000001, candidate.amount LIMIT 1`;
+      if (!slot) throw new AppError(503, 'TON_INVOICES_BUSY', 'Please try creating an invoice later');
+      await tx`UPDATE orders SET metadata = metadata || ${tx.json({ receiverRaw: receiver, payAmount: slot.amount })} WHERE id = ${order.id}`;
+      return slot.amount;
+    });
     return {
       externalId: `ton_${order.id}`,
       checkoutUrl: `${config.PUBLIC_APP_URL}/dashboard/orders/${order.id}`,
       expiresAt: order.reservedUntil,
       metadata: { payAddress: Address.parse(config.TON_RECEIVER_ADDRESS).toString({ bounceable: false }), receiverRaw: tonAddress(config.TON_RECEIVER_ADDRESS),
-        payAmount: new Decimal(order.amount).toFixed(2), payCurrency: 'usdtton', network: 'TON', asset: 'USDT',
-        payinExtraId: `ks_${order.id.replaceAll('-', '')}`, master: USDT_TON_MASTER,
-        autoApprove: config.TON_AUTO_APPROVE },
+        payAmount, payCurrency: 'usdtton', network: 'TON', asset: 'USDT',
+        verification: 'txid', master: USDT_TON_MASTER,
+        autoApprove: true },
     };
   }
   if (provider === 'mock') {

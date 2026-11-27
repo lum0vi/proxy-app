@@ -1,3 +1,4 @@
+import { inspectTonTransaction } from '../services/ton-payments.js';
 import type { FastifyInstance } from 'fastify';
 import { Decimal } from 'decimal.js';
 import { z } from 'zod';
@@ -190,6 +191,11 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
     let hash: string;
     try { hash = tonHash(transactionHash); } catch { throw new AppError(400, 'INVALID_TRANSACTION_HASH', 'Enter a TON transaction hash'); }
     const userId = (request as AuthenticatedRequest).authUser.id;
+    const [invoice] = await sql`SELECT metadata FROM orders WHERE id = ${id} AND user_id = ${userId} AND payment_provider = 'ton'`;
+    if (assertFound(invoice, 'ORDER_NOT_FOUND', 'TON invoice not found').metadata.verification === 'txid') {
+      await inspectTonTransaction(id, hash, true);
+      return { verified: true };
+    }
     // A public hash is not proof that the submitter owns a payment. This only opens a review request.
     const [order] = await sql`UPDATE orders SET metadata = metadata || ${sql.json({
       paymentClaim: { transactionHash: hash, submittedAt: new Date().toISOString() },
