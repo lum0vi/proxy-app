@@ -7,6 +7,7 @@ import { config } from '../config.js';
 import { sql } from '../db/index.js';
 import { encryptSecret, sha256, upstreamKeyFingerprint } from '../lib/crypto.js';
 import { tonAddress, USDT_TON_MASTER } from '../lib/ton.js';
+import { selectCredentialWithCapacity } from './capacity.js';
 import { createOrder } from './orders.js';
 import { scanTonPayments } from './ton-payments.js';
 
@@ -135,6 +136,28 @@ integration('direct USDT payments with real HTTP indexer and PostgreSQL', () => 
     const keys = await sql`SELECT credits_total::text AS total FROM api_keys WHERE order_id = ${order.id}`;
     expect(keys).toHaveLength(1);
     expect(Number(keys[0]!.total)).toBe(20);
+  });
+  it('honors a slot override and uses the configured lifetime for new invoices', async () => {
+    const order = await createOrder({ userId, userEmail: 'ton-customer@example.test', productId, paymentProvider: 'ton' });
+    const [deadline] = await sql<{ seconds: number }[]>`SELECT ceil(extract(epoch FROM reserved_until - created_at))::int AS seconds
+      FROM orders WHERE id = ${String(order.id)}`;
+    expect(deadline?.seconds).toBe(config.TON_INVOICE_TTL_MINUTES * 60);
+    await buy();
+
+    await sql.begin(async tx => {
+      await tx`SELECT set_config('proxykey.upstream_key_slot_limit', '2', true)`;
+      await expect(selectCredentialWithCapacity(tx, poolId)).rejects.toMatchObject({ code: 'NO_UPSTREAM_CAPACITY' });
+      await tx`SELECT set_config('proxykey.upstream_key_slot_limit', '0', true)`;
+      const [slots] = await tx`SELECT credential_capacity, free_slots FROM sellable_upstream_slots WHERE pool_id = ${poolId}`;
+      expect(slots).toEqual({ credentialCapacity: null, freeSlots: null });
+      await expect(selectCredentialWithCapacity(tx, poolId)).resolves.toHaveProperty('poolId', poolId);
+    });
+
+    if (config.UPSTREAM_KEY_SLOT_LIMIT === 0) {
+      await sql`UPDATE upstream_pools SET credential_capacity = 2 WHERE id = ${poolId}`;
+      try { expect((await buy()).metadata.verification).toBe('txid'); }
+      finally { await sql`UPDATE upstream_pools SET credential_capacity = 100 WHERE id = ${poolId}`; }
+    }
   });
   it('reports a missing scanner as stale so a stopped worker cannot look healthy', async () => {
     const response = await app.inject({ url: '/metrics' });

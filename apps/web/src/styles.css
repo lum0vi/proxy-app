@@ -144,3 +144,32 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 @media(max-width:480px){.checkout-token{display:none}.payment-ticket-heading,.payment-ticket-amount{padding:20px}.payment-instructions{padding:0 20px}.payment-countdown{margin-inline:20px}.payment-footnote{margin-inline:20px}.payment-help{padding:18px 16px}.receipt-card{padding:16px}.receipt-heading{align-items:start}.payment-health-grid>div{padding:13px}.economics-equation{gap:10px}.economics-equation b{font-size:17px}.economics-equation small{font-size:10px}}
 @media(prefers-reduced-motion:reduce){.selectable-products>button{transition:none}.selectable-products>button:hover{transform:none}}
 .payment-ticket .button{font-size:11px;gap:6px;padding:8px 10px}.payment-ticket .payment-ticket-amount .button span{font-size:11px;color:inherit;letter-spacing:0}.detail-list dd{min-width:0;text-align:right;overflow-wrap:anywhere}.detail-list dt{flex-shrink:0}.receipt-heading small{overflow-wrap:anywhere}
+
+.admin-panel-head, .admin-form-actions, .admin-table-actions, .admin-pagination {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.admin-form-grid { align-items: start; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.admin-form-actions { justify-content: flex-end; margin-top: 8px; }
+.admin-form-actions > :first-child:not(:only-child) { margin-inline-end: auto; }
+.admin-checkbox { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-soft); }
+.admin-checkbox input { flex: none; width: 16px; height: 16px; margin: 0; }
+.admin-pagination { justify-content: flex-end; padding-top: 12px; margin-top: 6px; border-top: 1px solid var(--line); }
+.admin-pagination span { min-inline-size: 3.5ch; text-align: center; color: var(--text-soft); font-size: 12px; font-variant-numeric: tabular-nums; }
+.admin-table-actions { gap: 6px; }
+.button.ghost.admin-delete { color: var(--danger); }
+.table-scroll:has(.admin-detail-row) { container-type: inline-size; }
+.admin-detail-row td { background: var(--bg-soft); white-space: normal; }
+.admin-table-editor {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 205px), 1fr));
+  gap: 14px;
+  align-items: end;
+  width: min(62rem, calc(100cqw - 26px));
+  padding-block: 4px;
+}
+.admin-table-editor .field, .admin-table-editor .form-error, .admin-table-editor .form-hint { margin: 0; }
+.admin-wide-field { grid-column: 1 / -1; }
+@media (max-width: 1050px) { .admin-form-grid { grid-template-columns: minmax(0, 1fr); } }

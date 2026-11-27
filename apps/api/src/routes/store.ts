@@ -78,7 +78,7 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
         ), '[]'::jsonb) AS models,
         COALESCE((SELECT jsonb_agg(jsonb_build_object('model', r.model, 'protocol', r.protocol) ORDER BY r.model)
           FROM unpriced_pool_models r WHERE r.root_pool_id = p.pool_id), '[]'::jsonb) AS unpriced_models,
-        COALESCE((SELECT sum(GREATEST(0, s.credential_capacity - s.assigned - s.reserved))::int
+        COALESCE((SELECT sum(COALESCE(s.free_slots, 1))::int
           FROM sellable_upstream_slots s JOIN pool_channels c USING (pool_id) WHERE c.root_pool_id = up.id), 0) AS inventory
       FROM products p JOIN upstream_pools up ON up.id = p.pool_id
       WHERE p.active AND up.active

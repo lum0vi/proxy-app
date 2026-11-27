@@ -1,4 +1,5 @@
 import type postgres from 'postgres';
+import { config } from '../config.js';
 import { AppError } from '../lib/errors.js';
 
 export interface ReservedCredential {
@@ -24,7 +25,7 @@ export async function selectCredentialWithCapacity(
   const preferred = options.preferredCredentialId ?? null;
   const model = options.model ?? null;
   const slotAvailable = transaction`
-    slots.assigned + slots.reserved - CASE WHEN EXISTS (
+    slots.credential_capacity IS NULL OR slots.assigned + slots.reserved - CASE WHEN EXISTS (
       SELECT 1 FROM upstream_slot_claims claim
       WHERE claim.upstream_credential_id = slots.id
         AND (claim.order_id = ${options.orderId ?? null}::uuid OR claim.api_key_id = ${options.apiKeyId ?? null}::uuid)
@@ -40,6 +41,9 @@ export async function selectCredentialWithCapacity(
     ), 0) >= ${options.minimumBudget ?? '0'}::numeric)
     AND (${slotAvailable})
   `;
+  const lockCredential = config.UPSTREAM_KEY_SLOT_LIMIT === 0
+    ? transaction`FOR UPDATE OF uc`
+    : transaction`FOR UPDATE OF uc SKIP LOCKED`;
   const rows = await transaction<ReservedCredential[]>`
     SELECT uc.id, uc.pool_id
     FROM upstream_credentials AS uc
@@ -53,7 +57,7 @@ export async function selectCredentialWithCapacity(
       uc.last_used_at ASC NULLS FIRST,
       uc.created_at ASC,
       uc.id ASC
-    FOR UPDATE OF uc SKIP LOCKED
+    ${lockCredential}
     LIMIT 1
   `;
   const credential = rows[0];

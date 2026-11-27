@@ -26,7 +26,7 @@ export function AdminVideos() {
   const states: Record<string, string> = ru ? { REVIEW: 'Нужна проверка', SUBMITTING: 'Отправляется', QUEUED: 'В очереди',
     IN_PROGRESS: 'Создаётся', COMPLETED: 'Готово', FAILED: 'Без списания' } : {};
   return <section className="panel">
-    <div className="section-heading"><h2>{ru ? 'Задачи генерации видео' : 'Video generation jobs'}</h2><button type="button" className="button ghost small" onClick={() => void remote.reload()}>{ru ? 'Обновить' : 'Refresh'}</button></div>
+    <div className="panel-head admin-panel-head"><h2>{ru ? 'Задачи генерации видео' : 'Video generation jobs'}</h2><button type="button" className="button ghost small" disabled={remote.loading} onClick={() => void remote.reload()}>{ru ? 'Обновить' : 'Refresh'}</button></div>
     <p className="form-hint">{ru ? 'Баланс резервируется до подтверждения результата. Задачи «Нужна проверка» удерживают резерв: проверьте их у поставщика и подтвердите результат либо освободите деньги без списания.' : 'Balance stays reserved until the result is confirmed. Review jobs retain their reservation: verify the provider result or release the funds without charging.'}</p>
     {error && <div className="form-error">{error}</div>}
     {remote.error && <div className="form-error" role="alert">{remote.error}</div>}

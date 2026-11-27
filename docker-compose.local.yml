@@ -3,7 +3,7 @@
 x-local-environment: &local-environment
   NODE_ENV: development
   PUBLIC_APP_URL: http://localhost:${APP_PORT:-8080}
-  SALES_ENABLED: "false"
+  SALES_ENABLED: "true"
   ALLOW_MOCK_PAYMENTS: "false"
 
 services:

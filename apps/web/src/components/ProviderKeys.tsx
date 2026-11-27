@@ -19,10 +19,10 @@ interface Inventory {
 
 function Pages({ page, total, size, busy, change }: { page: number; total: number; size: number; busy: boolean; change(page: number): void }) {
   const { locale } = usePreferences();
-  return <div className="card-actions">
-    <button className="button ghost small" disabled={busy || page <= 1} onClick={() => change(page - 1)}>{locale === 'ru' ? 'Назад' : 'Previous'}</button>
+  return <div className="admin-pagination" role="group" aria-label={locale === 'ru' ? 'Страницы таблицы' : 'Table pages'}>
+    <button type="button" className="button ghost small" disabled={busy || page <= 1} onClick={() => change(page - 1)}>{locale === 'ru' ? 'Назад' : 'Previous'}</button>
     <span>{page} / {Math.max(1, Math.ceil(total / size))}</span>
-    <button className="button ghost small" disabled={busy || page * size >= total} onClick={() => change(page + 1)}>{locale === 'ru' ? 'Далее' : 'Next'}</button>
+    <button type="button" className="button ghost small" disabled={busy || page * size >= total} onClick={() => change(page + 1)}>{locale === 'ru' ? 'Далее' : 'Next'}</button>
   </div>;
 }
 
@@ -44,7 +44,7 @@ export function ProviderKeys() {
     finally { setBusy(false); }
   }
   return <section className="panel">
-    <div className="panel-head"><h2>{ru ? 'Ключи в аккаунте CE' : 'Keys in the CE account'}</h2>
+    <div className="panel-head admin-panel-head"><h2>{ru ? 'Ключи в аккаунте CE' : 'Keys in the CE account'}</h2>
       <button className="button ghost small" disabled={busy || !data?.sync.enabled || data.sync.requested} onClick={() => void sync()}><RefreshCw size={15}/>{ru ? 'Синхронизировать с CE' : 'Sync from CE'}</button>
     </div>
     <p className="form-hint">{ru ? 'Остаток CE общий для привязанных клиентских ключей. Баланс покупателя в USDT показан отдельно. Здесь нет полных секретов ключей.' : 'The CE balance is shared by linked customer keys. Each customer balance in USDT is shown separately. Full key secrets are not displayed here.'}</p>

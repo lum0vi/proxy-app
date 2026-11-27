@@ -5,7 +5,7 @@ import {
   Settings2, ShieldCheck, ShoppingBag, Sun, TerminalSquare, UserRound, Users, Wallet,
   X, Zap,
 } from 'lucide-react';
-import { useEffect, useState, type FormEvent, type ReactNode } from 'react';
+import { Fragment, useEffect, useState, type FormEvent, type ReactNode } from 'react';
 import {
   Link, NavLink, Navigate, Outlet, Route, Routes, useLocation, useNavigate, useParams,
 } from 'react-router-dom';
@@ -430,8 +430,11 @@ function EmptyState({ icon: Icon, text, to }: { icon: typeof KeyRound; text: str
   return <div className="empty-state"><Icon/><p>{text}</p><Link className="button small" to={to}>{text}</Link></div>;
 }
 
-function DataTable({ headers, rows }: { headers: string[]; rows: ReactNode[][] }) {
-  return <div className="table-scroll"><table><thead><tr>{headers.map((header) => <th key={header}>{header}</th>)}</tr></thead><tbody>{rows.length ? rows.map((row, index) => <tr key={index}>{row.map((cell, cellIndex) => <td key={cellIndex}>{cell}</td>)}</tr>) : <tr><td colSpan={headers.length}>—</td></tr>}</tbody></table></div>;
+function DataTable({ headers, rows, detail }: { headers: string[]; rows: ReactNode[][]; detail?: { index: number; content: ReactNode } }) {
+  return <div className="table-scroll"><table><thead><tr>{headers.map((header, index) => <th key={index}>{header}</th>)}</tr></thead><tbody>{rows.length ? rows.map((row, index) => <Fragment key={index}>
+    <tr>{row.map((cell, cellIndex) => <td key={cellIndex}>{cell}</td>)}</tr>
+    {detail?.index === index && <tr className="admin-detail-row"><td colSpan={headers.length}>{detail.content}</td></tr>}
+  </Fragment>) : <tr><td colSpan={headers.length}>—</td></tr>}</tbody></table></div>;
 }
 
 function TopUpLink({ apiKey }: { apiKey: CustomerKey }) {
@@ -884,16 +887,81 @@ function AdminOverview() {
   </>;
 }
 
+interface ProviderCredential {
+  id: string;
+  poolName: string;
+  label: string;
+  keyHint: string;
+  status: 'ACTIVE' | 'DEGRADED' | 'DISABLED' | 'EXHAUSTED';
+  priority: number;
+  maxConcurrency: number;
+  spendLimit: string | null;
+  testOnly: boolean;
+  availableModels: string[];
+  catalogValidUntil: string | null;
+  lastHealthAt: string | null;
+  lastError: string | null;
+}
+
+interface ModelRate {
+  id: string;
+  poolId: string;
+  providerName: string;
+  model: string;
+  inputPerMillion: string;
+  outputPerMillion: string;
+  cachedInputPerMillion: string;
+  perRequest: string;
+  perSecond: string;
+  mediaOptions: Record<string, unknown>;
+  longContextThreshold: number | null;
+  longContextMultiplier: string;
+  peakMultiplier: string;
+  active: boolean;
+}
+
+function ModelRateFields({ rate }: { rate?: ModelRate }) {
+  const { t, locale } = usePreferences();
+  const ru = locale === 'ru';
+  return <>
+    <Field label={t('inputRate')} name="inputRate" type="number" min="0" step="0.00000001" defaultValue={rate?.inputPerMillion ?? '0'} required autoFocus={Boolean(rate)}/>
+    <Field label={t('outputRate')} name="outputRate" type="number" min="0" step="0.00000001" defaultValue={rate?.outputPerMillion ?? '0'} required/>
+    <Field label={t('cachedRate')} name="cachedRate" type="number" min="0" step="0.00000001" defaultValue={rate?.cachedInputPerMillion ?? '0'} required/>
+    <Field label={t('requestRate')} name="requestRate" type="number" min="0" step="0.00000001" defaultValue={rate?.perRequest ?? '0'} required/>
+    <Field label={ru ? 'Закупочная цена за секунду видео' : 'Wholesale price per video second'} name="secondRate" type="number" min="0" step="0.00000001" defaultValue={rate?.perSecond ?? '0'} required/>
+    <Field label={t('contextThreshold')} name="contextThreshold" type="number" min={1} defaultValue={rate?.longContextThreshold ?? ''} placeholder="272000"/>
+    <Field label={t('contextMultiplier')} name="contextMultiplier" type="number" min={1} step="0.0001" defaultValue={rate?.longContextMultiplier ?? '1'} required/>
+    <Field label={ru ? 'Множитель часов пик' : 'Peak-hour multiplier'} name="peakMultiplier" type="number" min={1} max={10} step="0.0001" defaultValue={rate?.peakMultiplier ?? ''} placeholder="1"/>
+    <label className="field admin-wide-field"><span>{ru ? 'Параметры, включённые в цену (JSON)' : 'Options included in this price (JSON)'}</span><textarea name="mediaOptions" defaultValue={JSON.stringify(rate?.mediaOptions ?? {}, null, 2)} rows={3} placeholder={'{"seconds":[4,8],"size":["1280x720"]}'}/></label>
+    <p className="form-hint admin-wide-field">{ru ? 'Видео: укажите seconds и цену за секунду. Для редактирования изображений добавьте operations: ["edit"]. size, quality и другие платные опции разрешайте только после проверки цены поставщика.' : 'Videos require seconds and a per-second price. Enable image edits with operations: ["edit"]. Allow size, quality and other paid options only after verifying the provider price.'}</p>
+  </>;
+}
+
 function AdminProviders() {
   const { t, locale } = usePreferences();
   const ru = locale === 'ru';
   const pools = useRemote(() => api<{ pools: AnyRecord[] }>('/api/admin/pools'), []);
-  const creds = useRemote(() => api<{ credentials: AnyRecord[] }>('/api/admin/credentials'), []);
-  const rates = useRemote(() => api<{ rates: AnyRecord[] }>('/api/admin/rates'), []);
+  const creds = useRemote(() => api<{ credentials: ProviderCredential[] }>('/api/admin/credentials'), []);
+  const rates = useRemote(() => api<{ rates: ModelRate[] }>('/api/admin/rates'), []);
   const [error, setError] = useState('');
+  const [credentialError, setCredentialError] = useState('');
+  const [rateError, setRateError] = useState('');
+  const [addRateError, setAddRateError] = useState('');
+  const [editingCredential, setEditingCredential] = useState<string | null>(null);
+  const [editingRate, setEditingRate] = useState<string | null>(null);
+  const [credentialBusy, setCredentialBusy] = useState(false);
+  const [rateBusy, setRateBusy] = useState(false);
   const protocols = [ ['OPENAI', 'Responses + Chat Completions'], ['OPENAI_CHAT', 'Chat Completions'],
     ['ANTHROPIC', 'Anthropic Messages'], ['GEMINI', 'Gemini'], ['IMAGES', 'Images'], ['VIDEOS', 'Videos'] ];
   const poolList = pools.data?.pools ?? [];
+  const credentials = creds.data?.credentials ?? [];
+  const modelRates = rates.data?.rates ?? [];
+  const credentialIndex = credentials.findIndex(({ id }) => id === editingCredential);
+  const rateIndex = modelRates.findIndex(({ id }) => id === editingRate);
+  const selectedCredential = credentials[credentialIndex];
+  const selectedRate = modelRates[rateIndex];
+  const editLabel = ru ? 'Редактировать' : 'Edit';
+  const cancelLabel = ru ? 'Отмена' : 'Cancel';
 
   async function addPool(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); const element = event.currentTarget; const form = new FormData(element); setError('');
@@ -920,28 +988,68 @@ function AdminProviders() {
     } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
   }
 
-  async function addRate(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); const element = event.currentTarget; const form = new FormData(element); setError('');
+  async function saveRate(event: FormEvent<HTMLFormElement>, rate?: ModelRate) {
+    event.preventDefault();
+    const element = event.currentTarget;
+    const form = new FormData(element);
+    const setFormError = rate ? setRateError : setAddRateError;
+    setFormError('');
+    setRateBusy(true);
     try {
       await api('/api/admin/rates', { method: 'POST', body: JSON.stringify({
-        poolId: form.get('poolId'), model: form.get('model'),
+        poolId: rate?.poolId ?? form.get('poolId'), model: rate?.model ?? form.get('model'),
         inputPerMillion: form.get('inputRate'), outputPerMillion: form.get('outputRate'),
         cachedInputPerMillion: form.get('cachedRate'), perRequest: form.get('requestRate') || '0',
         perSecond: form.get('secondRate') || '0', mediaOptions: JSON.parse(String(form.get('mediaOptions') || '{}')),
         longContextThreshold: form.get('contextThreshold') ? Number(form.get('contextThreshold')) : null,
-        longContextMultiplier: form.get('contextMultiplier') || '1', active: true,
+        longContextMultiplier: form.get('contextMultiplier') || '1', active: !rate || form.has('active'),
         ...(form.get('peakMultiplier') ? { peakMultiplier: Number(form.get('peakMultiplier')) } : {}),
       }) });
-      element.reset(); await rates.reload();
-    } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+      if (rate) setEditingRate(null);
+      else element.reset();
+      await rates.reload();
+    } catch (cause) { setFormError(cause instanceof Error ? cause.message : String(cause)); }
+    finally { setRateBusy(false); }
   }
 
-  async function updateCredential(credential: AnyRecord, change: { status?: 'ACTIVE' | 'DISABLED'; testOnly?: boolean }) {
-    setError('');
+  async function updateCredential(credential: ProviderCredential, change: Partial<Pick<ProviderCredential, 'label' | 'status' | 'priority' | 'maxConcurrency' | 'spendLimit' | 'testOnly'>> & { apiKey?: string }, closeEditor = false) {
+    setCredentialBusy(true);
+    setCredentialError('');
     try {
       await api(`/api/admin/credentials/${credential.id}`, { method: 'PATCH', body: JSON.stringify(change) });
+      if (closeEditor) setEditingCredential(null);
       await Promise.all([creds.reload(), pools.reload()]);
-    } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+    } catch (cause) { setCredentialError(cause instanceof Error ? cause.message : String(cause)); }
+    finally { setCredentialBusy(false); }
+  }
+
+  function saveCredential(event: FormEvent<HTMLFormElement>, credential: ProviderCredential) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const apiKey = String(form.get('apiKey') ?? '').trim();
+    const testOnly = form.has('testOnly');
+    void updateCredential(credential, {
+      label: String(form.get('label')), priority: Number(form.get('priority')),
+      maxConcurrency: Number(form.get('maxConcurrency')), spendLimit: String(form.get('spendLimit') ?? '') || null,
+      ...(apiKey && { apiKey }), ...(testOnly !== credential.testOnly && { testOnly }),
+    }, true);
+  }
+
+  async function removeCredential(credential: ProviderCredential) {
+    if (!confirm(ru
+      ? `Удалить «${credential.label}» из Ksapi? Если подходящей замены нет, запросы привязанных клиентов могут перестать работать.`
+      : `Remove “${credential.label}” from Ksapi? Linked customers may lose access if there is no replacement.`)) return;
+    setCredentialBusy(true);
+    setCredentialError('');
+    try {
+      await api(`/api/admin/credentials/${credential.id}`, { method: 'DELETE' });
+      setEditingCredential(null);
+      await Promise.all([creds.reload(), pools.reload()]);
+    } catch (cause) {
+      setCredentialError(ru && cause instanceof ApiError && cause.code === 'CREDENTIAL_IN_USE'
+        ? 'Ключ нужен для активных запросов, доступных видео или незавершённого выпуска CE.'
+        : cause instanceof Error ? cause.message : String(cause));
+    } finally { setCredentialBusy(false); }
   }
 
   return <>
@@ -960,51 +1068,83 @@ function AdminProviders() {
         <label className="field"><span>{ru ? 'Объединить с пулом' : 'Link to pool'}</span><select name="parentPoolId"><option value="">{ru ? 'Отдельный пул' : 'Standalone pool'}</option>{poolList.filter((pool) => !pool.parentPoolId).map((pool) => <option key={String(pool.id)} value={String(pool.id)}>{String(pool.name)}</option>)}</select></label>
         <Field label={ru ? 'Приоритет маршрута' : 'Routing priority'} name="routingPriority" type="number" min={0} max={10000} defaultValue={0} required/>
         <Field label={t('usersPerKey')} name="capacity" type="number" min={1} defaultValue={2} required/>
-        <button className="button"><Plus/>{t('add')}</button>
+        <div className="admin-form-actions"><button className="button"><Plus size={18}/>{t('add')}</button></div>
       </form>
       <form className="panel compact-form" onSubmit={addCredential}>
         <h2>{t('addCredential')}</h2>
         <label className="field"><span>{t('provider')}</span><select name="poolId" required>{pools.data?.pools.map((pool) => <option key={String(pool.id)} value={String(pool.id)}>{String(pool.name)}</option>)}</select></label>
-        <Field label={t('label')} name="label" required/>
-        <Field label={t('apiKey')} name="apiKey" type="password" required/>
+        <Field label={t('label')} name="label" autoComplete="off" required/>
+        <Field label={t('apiKey')} name="apiKey" type="password" autoComplete="new-password" required/>
         <Field label={t('maxConcurrency')} name="maxConcurrency" type="number" min={1} defaultValue={8} required/>
         <Field label={t('spendLimit')} name="spendLimit" type="number" min="0.00000001" step="0.00000001"/>
-        <label className="form-hint"><input type="checkbox" name="testOnly"/> {ru ? 'Только для тестовой оплаты' : 'Use for mock payments only'}</label>
-        <button className="button"><Plus/>{t('add')}</button>
+        <div className="admin-form-actions">
+          <label className="admin-checkbox"><input type="checkbox" name="testOnly"/>{ru ? 'Только для тестовой оплаты' : 'Use for mock payments only'}</label>
+          <button className="button"><Plus size={18}/>{t('add')}</button>
+        </div>
       </form>
-      <form className="panel compact-form" onSubmit={addRate}>
+      <form className="panel compact-form" onSubmit={event => void saveRate(event)}>
         <h2>{t('addRate')}</h2>
         <label className="field"><span>{t('provider')}</span><select name="poolId" required>{pools.data?.pools.map((pool) => <option key={String(pool.id)} value={String(pool.id)}>{String(pool.name)}</option>)}</select></label>
         <Field label={t('model')} name="model" required placeholder="model-id"/>
-        <Field label={t('inputRate')} name="inputRate" type="number" min="0" step="0.00000001" defaultValue="0" required/>
-        <Field label={t('outputRate')} name="outputRate" type="number" min="0" step="0.00000001" defaultValue="0" required/>
-        <Field label={t('cachedRate')} name="cachedRate" type="number" min="0" step="0.00000001" defaultValue="0" required/>
-        <Field label={t('requestRate')} name="requestRate" type="number" min="0" step="0.00000001" defaultValue="0" required/>
-        <Field label={ru ? 'Закупочная цена за секунду видео' : 'Wholesale price per video second'} name="secondRate" type="number" min="0" step="0.00000001" defaultValue="0" required/>
-        <label className="field"><span>{ru ? 'Параметры, включённые в цену (JSON)' : 'Options included in this price (JSON)'}</span><textarea name="mediaOptions" defaultValue="{}" rows={3} placeholder={'{"seconds":[4,8],"size":["1280x720"]}'}/></label>
-        <p className="form-hint">{ru ? 'Видео: укажите seconds и цену за секунду. Для редактирования изображений добавьте operations: ["edit"]. size, quality и другие платные опции разрешайте только после проверки цены поставщика.' : 'Videos require seconds and a per-second price. Enable image edits with operations: ["edit"]. Allow size, quality and other paid options only after verifying the provider price.'}</p>
-        <Field label={t('contextThreshold')} name="contextThreshold" type="number" min="1" placeholder="272000"/>
-        <Field label={t('contextMultiplier')} name="contextMultiplier" type="number" min="1" step="0.01" defaultValue="1" required/>
-        <Field label={ru ? 'Множитель часов пик' : 'Peak-hour multiplier'} name="peakMultiplier" type="number" min="1" max="10" step="0.0001" placeholder="1"/>
-        <button className="button"><Plus/>{t('add')}</button>
+        <ModelRateFields/>
+        {addRateError && <p className="form-error" role="alert">{addRateError}</p>}
+        <div className="admin-form-actions"><button className="button" disabled={rateBusy}><Plus size={18}/>{t('add')}</button></div>
       </form>
     </div>
-    <section className="panel"><h2>{t('providers')}</h2><DataTable headers={[t('provider'), ru ? 'Протокол' : 'Protocol', ru ? 'Родительский пул' : 'Parent pool', t('baseUrl'), t('usersPerKey'), 'Credentials', 'Assigned']} rows={poolList.map((pool) => [String(pool.name), protocols.find(([id]) => id === pool.protocol)?.[1] ?? '—', String(poolList.find(({ id }) => id === pool.parentPoolId)?.name ?? '—'), <code>{String(pool.baseUrl)}</code>, String(pool.credentialCapacity), String(pool.credentialCount), String(pool.assignedKeys)])}/></section>
+    <section className="panel"><h2>{t('providers')}</h2><DataTable headers={[t('provider'), ru ? 'Протокол' : 'Protocol', ru ? 'Родительский пул' : 'Parent pool', t('baseUrl'), t('usersPerKey'), 'Credentials', 'Assigned']} rows={poolList.map((pool) => [String(pool.name), protocols.find(([id]) => id === pool.protocol)?.[1] ?? '—', String(poolList.find(({ id }) => id === pool.parentPoolId)?.name ?? '—'), <code>{String(pool.baseUrl)}</code>, pool.slotLimit === null ? (ru ? 'Без лимита' : 'Unlimited') : String(pool.slotLimit ?? pool.credentialCapacity), String(pool.credentialCount), String(pool.assignedKeys)])}/></section>
     <section className="panel"><div className="panel-head"><h2>{t('upstreamCredentials')}</h2><button className="button ghost small" onClick={() => void creds.reload()}><RefreshCw size={15}/>{t('status')}</button></div>
-      <DataTable headers={[t('provider'), t('label'), t('apiKey'), t('status'), t('catalogModels'), t('lastHealthCheck'), t('providerIssue'), '']}
-        rows={(creds.data?.credentials ?? []).map((credential) => {
-          const models = Array.isArray(credential.availableModels) ? credential.availableModels.map(String) : [];
-          const status = String(credential.status);
-          const stale = status === 'ACTIVE' && (!credential.catalogValidUntil || Date.parse(String(credential.catalogValidUntil)) <= Date.now());
-          return [String(credential.poolName), <span>{String(credential.label)}{Boolean(credential.testOnly) && <small className="catalog-status"> · {ru ? 'Тестовый' : 'Test only'}</small>}</span>, <code>{String(credential.keyHint)}</code>, <StatusPill status={stale ? 'DEGRADED' : status}/>,
-            <span title={models.join(', ')}>{models.length || '—'}</span>, formatDate(credential.lastHealthAt ? String(credential.lastHealthAt) : null, locale),
-            <span className="credential-issue">{String(credential.lastError ?? '—')}</span>,
-            <div className="row-actions">{status !== 'EXHAUSTED' && <button className="text-button" onClick={() => void updateCredential(credential, { status: 'ACTIVE' })}>{status === 'DISABLED' ? t('activate') : t('refreshCatalog')}</button>}
-              {status !== 'DISABLED' && <button className="text-button" onClick={() => void updateCredential(credential, { status: 'DISABLED' })}>{t('disable')}</button>}
-              {!credential.testOnly && <button className="text-button" onClick={() => void updateCredential(credential, { testOnly: true })}>{ru ? 'Только для теста' : 'Mark test only'}</button>}</div>];
-        })}/>
+      {(credentialError && !selectedCredential || creds.error) && <p className="form-error" role="alert">{creds.error || credentialError}</p>}
+      <DataTable headers={[t('provider'), t('label'), t('apiKey'), t('status'), t('catalogModels'), t('lastHealthCheck'), t('providerIssue'), ru ? 'Действия' : 'Actions']}
+        rows={credentials.map(credential => {
+          const { availableModels: models, status, catalogValidUntil } = credential;
+          const stale = status === 'ACTIVE' && (!catalogValidUntil || Date.parse(catalogValidUntil) <= Date.now());
+          return [credential.poolName, <span>{credential.label}{credential.testOnly && <small className="catalog-status"> · {ru ? 'Тестовый' : 'Test only'}</small>}</span>, <code>{credential.keyHint}</code>, <StatusPill status={stale ? 'DEGRADED' : status}/>,
+            <span title={models.join(', ')}>{models.length || '—'}</span>, formatDate(credential.lastHealthAt, locale),
+            <span className="credential-issue">{credential.lastError ?? '—'}</span>,
+            <div className="admin-table-actions">
+              <button type="button" className="button small ghost" disabled={credentialBusy} aria-expanded={editingCredential === credential.id} onClick={() => { setCredentialError(''); setEditingCredential(editingCredential === credential.id ? null : credential.id); }}>{editLabel}</button>
+              <button type="button" className="button small ghost admin-delete" disabled={credentialBusy} onClick={() => void removeCredential(credential)}>{ru ? 'Удалить' : 'Delete'}</button>
+            </div>];
+        })}
+        detail={selectedCredential && { index: credentialIndex, content: <form key={selectedCredential.id} className="admin-table-editor" onSubmit={event => saveCredential(event, selectedCredential)}>
+          <strong className="admin-wide-field">{selectedCredential.poolName} · {selectedCredential.keyHint}</strong>
+          <Field label={t('label')} name="label" defaultValue={selectedCredential.label} minLength={2} maxLength={100} autoComplete="off" autoFocus required/>
+          <Field label={ru ? 'Новый API-ключ' : 'New API key'} name="apiKey" type="password" minLength={8} maxLength={2000} autoComplete="new-password" placeholder={ru ? 'Оставьте пустым, чтобы сохранить текущий' : 'Leave blank to keep the current key'}/>
+          <Field label={ru ? 'Приоритет ключа' : 'Key priority'} name="priority" type="number" min={0} max={10000} defaultValue={selectedCredential.priority} required/>
+          <Field label={t('maxConcurrency')} name="maxConcurrency" type="number" min={1} max={1000} defaultValue={selectedCredential.maxConcurrency} required/>
+          <Field label={t('spendLimit')} name="spendLimit" type="number" min="0" step="0.00000001" defaultValue={selectedCredential.spendLimit ?? ''}/>
+          <label className="admin-checkbox"><input type="checkbox" name="testOnly" defaultChecked={selectedCredential.testOnly}/>{ru ? 'Только для тестовой оплаты' : 'Use for mock payments only'}</label>
+          {credentialError && <p className="form-error admin-wide-field" role="alert">{credentialError}</p>}
+          <div className="admin-form-actions admin-wide-field">
+            <div className="admin-table-actions">
+              {selectedCredential.status !== 'EXHAUSTED' && <button type="button" className="button small ghost" disabled={credentialBusy} onClick={() => void updateCredential(selectedCredential, { status: 'ACTIVE' })}>{selectedCredential.status === 'DISABLED' ? t('activate') : t('refreshCatalog')}</button>}
+              {selectedCredential.status !== 'DISABLED' && <button type="button" className="button small ghost" disabled={credentialBusy} onClick={() => void updateCredential(selectedCredential, { status: 'DISABLED' })}>{t('disable')}</button>}
+            </div>
+            <div className="admin-table-actions">
+              <button type="button" className="button small ghost" disabled={credentialBusy} onClick={() => setEditingCredential(null)}>{cancelLabel}</button>
+              <button className="button small" disabled={credentialBusy}>{t('save')}</button>
+            </div>
+          </div>
+        </form> }}/>
     </section>
-    <section className="panel"><h2>{t('modelRates')}</h2><DataTable headers={[t('provider'), t('model'), t('inputRate'), t('outputRate'), t('cachedRate'), t('requestRate'), ru ? 'За секунду' : 'Per second', t('contextMultiplier'), ru ? 'Часы пик' : 'Peak hours', t('status')]} rows={(rates.data?.rates ?? []).map((rate) => [String(rate.providerName), <code>{String(rate.model)}</code>, String(rate.inputPerMillion), String(rate.outputPerMillion), String(rate.cachedInputPerMillion), String(rate.perRequest), String(rate.perSecond), rate.longContextThreshold ? `${String(rate.longContextMultiplier)}× > ${String(rate.longContextThreshold)}` : '—', Number(rate.peakMultiplier) > 1 ? `${Number(rate.peakMultiplier)}×` : '—', <StatusPill status={Boolean(rate.active) ? 'ACTIVE' : 'DISABLED'}/>])}/></section>
+    <section className="panel"><div className="panel-head"><h2>{t('modelRates')}</h2></div>
+      {rates.error && <p className="form-error" role="alert">{rates.error}</p>}
+      <DataTable headers={[t('provider'), t('model'), t('inputRate'), t('outputRate'), t('cachedRate'), t('requestRate'), ru ? 'За секунду' : 'Per second', t('contextMultiplier'), ru ? 'Часы пик' : 'Peak hours', t('status'), ru ? 'Действия' : 'Actions']}
+        rows={modelRates.map(rate => [rate.providerName, <code>{rate.model}</code>, rate.inputPerMillion, rate.outputPerMillion, rate.cachedInputPerMillion, rate.perRequest, rate.perSecond, rate.longContextThreshold ? `${rate.longContextMultiplier}× > ${rate.longContextThreshold}` : '—', Number(rate.peakMultiplier) > 1 ? `${Number(rate.peakMultiplier)}×` : '—', <StatusPill status={rate.active ? 'ACTIVE' : 'DISABLED'}/>,
+          <button type="button" className="button small ghost" disabled={rateBusy} aria-expanded={editingRate === rate.id} onClick={() => { setRateError(''); setEditingRate(editingRate === rate.id ? null : rate.id); }}>{editLabel}</button>])}
+        detail={selectedRate && { index: rateIndex, content: <form key={selectedRate.id} className="admin-table-editor" onSubmit={event => void saveRate(event, selectedRate)}>
+          <strong className="admin-wide-field">{selectedRate.providerName} · {selectedRate.model}</strong>
+          <ModelRateFields rate={selectedRate}/>
+          {rateError && <p className="form-error admin-wide-field" role="alert">{rateError}</p>}
+          <div className="admin-form-actions admin-wide-field">
+            <label className="admin-checkbox"><input type="checkbox" name="active" defaultChecked={selectedRate.active}/>{ru ? 'Тариф активен' : 'Rate is active'}</label>
+            <div className="admin-table-actions">
+              <button type="button" className="button small ghost" disabled={rateBusy} onClick={() => setEditingRate(null)}>{cancelLabel}</button>
+              <button className="button small" disabled={rateBusy}>{t('save')}</button>
+            </div>
+          </div>
+        </form> }}/>
+    </section>
   </>;
 }
 

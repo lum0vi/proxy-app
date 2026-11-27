@@ -286,10 +286,10 @@ export async function retryPaidOrders(): Promise<void> {
         AND (o.top_up_key_id IS NULL OR uc.spend_limit IS NULL OR uc.spend_limit - uc.spend_used
           >= (GREATEST(ak.credits_total - ak.credits_used, 0) + COALESCE(o.credit_amount, o.amount))
             * original.wholesale_credits / COALESCE(original.credit_amount, original.amount))
-        AND s.assigned + s.reserved - CASE WHEN EXISTS (
+        AND (s.credential_capacity IS NULL OR s.assigned + s.reserved - CASE WHEN EXISTS (
           SELECT 1 FROM upstream_slot_claims claim WHERE claim.upstream_credential_id = s.id
             AND (claim.order_id = o.id OR claim.api_key_id = o.top_up_key_id)
-        ) THEN 1 ELSE 0 END < s.credential_capacity
+        ) THEN 1 ELSE 0 END < s.credential_capacity)
     ) ORDER BY o.paid_at, o.id LIMIT 50
   `;
   for (const order of orders) {
