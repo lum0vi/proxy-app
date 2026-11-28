@@ -10,7 +10,7 @@ import { encryptSecret, sha256, upstreamKeyFingerprint } from '../lib/crypto.js'
 import { tonAddress, USDT_TON_MASTER } from '../lib/ton.js';
 import { selectCredentialWithCapacity } from './capacity.js';
 import { createOrder } from './orders.js';
-import { createCheckout } from './payments.js';
+import { createCheckout, type CheckoutOrder } from './payments.js';
 import { scanTonPayments } from './ton-payments.js';
 
 const integration = process.env.RUN_INTEGRATION_TESTS === 'true' ? describe : describe.skip;
@@ -25,6 +25,16 @@ integration('direct USDT payments with real HTTP indexer and PostgreSQL', () => 
   const methods = [...config.paymentMethods];
   const hash = () => randomBytes(32).toString('base64');
   const state = async (id: string) => (await sql<{ status: string; metadata: Record<string, unknown> }[]>`SELECT status, metadata FROM orders WHERE id = ${id}`)[0]!;
+  async function pendingOrder(amount = '20.00'): Promise<CheckoutOrder> {
+    const id = randomUUID();
+    const reservedUntil = new Date(Date.now() + config.TON_INVOICE_TTL_MINUTES * 60_000);
+    // Prepare the checkout state without racing the separate upstream-capacity selector.
+    await sql`INSERT INTO orders (id, user_id, product_id, pool_id, payment_provider, currency,
+      amount, credit_amount, price_markup, wholesale_credits, grant_label, grant_concurrency_limit, reserved_until)
+      VALUES (${id}, ${userId}, ${productId}, ${poolId}, 'ton', 'USDT', ${amount}, ${amount},
+        ${config.PRICE_MARKUP}, ${new Decimal(amount).div(config.PRICE_MARKUP).toFixed(8)}, 'TON key', 2, ${reservedUntil})`;
+    return { id, amount, currency: 'USDT', productName: 'TON key', userEmail: 'ton-customer@example.test', reservedUntil };
+  }
   async function buy(topUpKeyId?: string) {
     const order = await createOrder({ userId, userEmail: 'ton-customer@example.test', productId, paymentProvider: 'ton', ...(topUpKeyId && { topUpKeyId }) });
     // Chain time precedes polling by a minute, but follows invoice creation.
@@ -119,7 +129,7 @@ integration('direct USDT payments with real HTTP indexer and PostgreSQL', () => 
   });
 
   it('credits only an exact verified TXID for its invoice, once across concurrent submissions', async () => {
-    const [order, other] = await Promise.all([buy(), buy()]);
+    const order = await buy(), other = await buy();
     expect(order.metadata.verification).toBe('txid');
     expect(order.metadata.payinExtraId).toBeUndefined();
     expect(order.metadata.payAmount).toMatch(/^20\.00[12]$/);
@@ -159,20 +169,29 @@ integration('direct USDT payments with real HTTP indexer and PostgreSQL', () => 
   });
 
   it('allocates only two distinct amounts under concurrency and reuses an amount after its reservation expires', async () => {
-    const results = await Promise.allSettled([buy(), buy(), buy()]);
-    const allocated = results.flatMap(result => result.status === 'fulfilled' ? [result.value] : []);
+    const orders = [await pendingOrder(), await pendingOrder(), await pendingOrder()];
+    const results = await Promise.allSettled(orders.map(order => createCheckout('ton', order)));
+    const allocated = results.flatMap((result, index) => result.status === 'fulfilled'
+      ? [{ id: orders[index]!.id, metadata: result.value.metadata! }] : []);
     const rejected = results.filter(result => result.status === 'rejected');
     expect(allocated).toHaveLength(2);
     expect(allocated.map(order => order.metadata.payAmount).sort()).toEqual(['20.001', '20.002']);
     expect(rejected).toHaveLength(1);
     expect(rejected[0]).toMatchObject({ reason: { code: 'TON_INVOICES_BUSY', statusCode: 503 } });
-    const failed = await sql`SELECT metadata FROM orders WHERE user_id = ${userId} AND status = 'FAILED'`;
-    expect(failed).toHaveLength(1);
-    expect(failed[0]!.metadata.payAmount).toBeUndefined();
+    const unallocated = orders[results.findIndex(result => result.status === 'rejected')]!;
+    expect((await state(unallocated.id)).metadata.payAmount).toBeUndefined();
 
     const expired = allocated[0]!;
     await sql`UPDATE orders SET reserved_until = now() - interval '5 minutes' WHERE id = ${expired.id}`;
-    expect((await buy()).metadata.payAmount).toBe(expired.metadata.payAmount);
+    expect((await createCheckout('ton', await pendingOrder())).metadata!.payAmount).toBe(expired.metadata.payAmount);
+  });
+
+  it('marks an order failed when both invoice amounts are already reserved', async () => {
+    await buy(); await buy();
+    await expect(buy()).rejects.toMatchObject({ code: 'TON_INVOICES_BUSY', statusCode: 503 });
+    const failed = await sql`SELECT metadata FROM orders WHERE user_id = ${userId} AND status = 'FAILED'`;
+    expect(failed).toHaveLength(1);
+    expect(failed[0]!.metadata.payAmount).toBeUndefined();
   });
 
   it.each([
@@ -182,15 +201,13 @@ integration('direct USDT payments with real HTTP indexer and PostgreSQL', () => 
     ['20.99', ['20.991', '20.992']],
     ['19.9999', ['20.000', '20.001']],
   ] as const)('keeps three decimal places and the surcharge cap for a base amount of %s', async (baseAmount, expected) => {
-    const orders = await Promise.all([buy(), buy()]);
-    // Exercise the checkout boundary directly, including a higher-precision historical price.
-    await sql`UPDATE orders SET amount = ${baseAmount}, credit_amount = ${baseAmount},
-      wholesale_credits = ${new Decimal(baseAmount).div(config.PRICE_MARKUP).toFixed(8)}, metadata = '{}'::jsonb
-      WHERE id IN (${orders[0]!.id}, ${orders[1]!.id})`;
-    const checkouts = await Promise.all(orders.map(order => createCheckout('ton', {
-      id: order.id, amount: baseAmount, currency: 'USDT', productName: 'TON key',
-      userEmail: 'ton-customer@example.test', reservedUntil: new Date(Date.now() + 60_000),
-    })));
+    const orders = [await pendingOrder(baseAmount), await pendingOrder(baseAmount)];
+    // Wait for every request even on failure, so no late writes leak into the next test.
+    const results = await Promise.allSettled(orders.map(order => createCheckout('ton', order)));
+    const checkouts = results.map(result => {
+      if (result.status === 'rejected') throw result.reason;
+      return result.value;
+    });
     expect(checkouts.map(checkout => checkout.metadata!.payAmount).sort()).toEqual(expected);
     for (const [index, checkout] of checkouts.entries()) {
       const amount = String(checkout.metadata!.payAmount);
